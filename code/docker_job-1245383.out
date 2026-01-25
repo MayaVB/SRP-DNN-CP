@@ -1,0 +1,94 @@
+=== SLURM JOB INFO ===
+Job ID: 1245383
+Job GPUs: 0
+Node:   hpc8h200-01
+CWD:    /home/dsi/mayavb/PythonProjects/SRP-DNN/code
+=====================
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+=== INSIDE CONTAINER ===
+PWD: /
+USER: mayavb
+========================
+SRPDNN_WORKDIR=/workspace
+HOME=/home/mayavb
+=== Choose python that has torch ===
+PY=python3
+sys.executable: /usr/bin/python3
+python: 3.10.12 (main, Nov  4 2025, 08:48:33) [GCC 11.4.0]
+torch: 2.11.0.dev20260104+cu128
+cuda runtime: 12.8
+cuda available: True
+device: NVIDIA H200
+capability: (9, 0)
+=== Ensure tensorboard in SAME env ===
+Defaulting to user installation because normal site-packages is not writeable
+Requirement already satisfied: tensorboard in /usr/local/lib/python3.10/dist-packages (2.20.0)
+Requirement already satisfied: absl-py>=0.4 in /usr/local/lib/python3.10/dist-packages (from tensorboard) (2.3.1)
+Requirement already satisfied: grpcio>=1.48.2 in /usr/local/lib/python3.10/dist-packages (from tensorboard) (1.76.0)
+Requirement already satisfied: markdown>=2.6.8 in /usr/local/lib/python3.10/dist-packages (from tensorboard) (3.10)
+Requirement already satisfied: numpy>=1.12.0 in /usr/local/lib/python3.10/dist-packages (from tensorboard) (2.2.6)
+Requirement already satisfied: packaging in /usr/local/lib/python3.10/dist-packages (from tensorboard) (25.0)
+Requirement already satisfied: pillow in /usr/local/lib/python3.10/dist-packages (from tensorboard) (12.0.0)
+Requirement already satisfied: protobuf!=4.24.0,>=3.19.6 in /usr/local/lib/python3.10/dist-packages (from tensorboard) (6.33.2)
+Requirement already satisfied: setuptools>=41.0.0 in /usr/lib/python3/dist-packages (from tensorboard) (59.6.0)
+Requirement already satisfied: tensorboard-data-server<0.8.0,>=0.7.0 in /usr/local/lib/python3.10/dist-packages (from tensorboard) (0.7.2)
+Requirement already satisfied: werkzeug>=1.0.1 in /usr/local/lib/python3.10/dist-packages (from tensorboard) (3.1.4)
+Requirement already satisfied: typing-extensions~=4.12 in /usr/local/lib/python3.10/dist-packages (from grpcio>=1.48.2->tensorboard) (4.15.0)
+Requirement already satisfied: markupsafe>=2.1.1 in /usr/local/lib/python3.10/dist-packages (from werkzeug>=1.0.1->tensorboard) (3.0.2)
+=== tensorboard check ===
+tensorboard: 2.20.0
+=== Dataset link ===
+total 8128
+drwxr-xr-x 253 mayavb dsi 5455 Aug 16  2014 .
+drwxr-xr-x   6 mayavb dsi  291 Jan 25 09:15 ..
+drwxr-xr-x   4 mayavb dsi   44 Aug 16  2014 103
+drwxr-xr-x   3 mayavb dsi   24 Aug 16  2014 1034
+drwxr-xr-x   3 mayavb dsi   24 Aug 16  2014 1040
+drwxr-xr-x   4 mayavb dsi   48 Aug 16  2014 1069
+drwxr-xr-x   4 mayavb dsi   48 Aug 16  2014 1081
+drwxr-xr-x   5 mayavb dsi   72 Aug 16  2014 1088
+drwxr-xr-x   3 mayavb dsi   24 Aug 16  2014 1098
+drwxr-xr-x   5 mayavb dsi   72 Aug 16  2014 1116
+drwxr-xr-x   5 mayavb dsi   71 Aug 16  2014 118
+drwxr-xr-x   6 mayavb dsi   96 Aug 16  2014 1183
+drwxr-xr-x   5 mayavb dsi   72 Aug 16  2014 1235
+drwxr-xr-x   5 mayavb dsi   72 Aug 16  2014 1246
+drwxr-xr-x   4 mayavb dsi   48 Aug 16  2014 125
+drwxr-xr-x   5 mayavb dsi   72 Aug 16  2014 1263
+drwxr-xr-x   3 mayavb dsi   24 Aug 16  2014 1334
+drwxr-xr-x   3 mayavb dsi   23 Aug 16  2014 1355
+drwxr-xr-x   4 mayavb dsi   48 Aug 16  2014 1363
+=== RUN SRP-DNN ===
+DirBurst disabled - using spatial white noise for testing
+# Parameters: 0.861696 M
+Training Stage!
+
+Epoch 1/20:
+Val loss: 0.2393, Val MDR: 18.18%, Val FAR: 4.70%, Val MAE: 3.72deg
+	 Saving 1 epoch model checkpoint...
+	 Found a max score in the 1 epoch, saving...
+
+Epoch 2/20:
+Val loss: 0.1860, Val MDR: 9.82%, Val FAR: 8.42%, Val MAE: 3.68deg
+	 Saving 2 epoch model checkpoint...
+	 Found a max score in the 2 epoch, saving...
+
+Epoch 3/20:
+Val loss: 0.2486, Val MDR: 11.03%, Val FAR: 9.73%, Val MAE: 3.65deg
+	 Saving 3 epoch model checkpoint...
+
+Epoch 4/20:

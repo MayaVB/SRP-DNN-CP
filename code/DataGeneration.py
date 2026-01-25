@@ -21,8 +21,40 @@ from utils import set_seed, save_file, load_file
 from Dataset import Parameter
 import Dataset as at_dataset
 
+# Create a temporary opts object to access methods without parsing args again
 opts = opt()
 dirs = opts.dir()
+
+# Try to get DirBurst arguments if available, otherwise use defaults
+try:
+    import sys
+    enable_dirburst = '--enable-dirburst' in sys.argv
+    dirburst_num_bursts = 3
+    dirburst_duration_min = 0.3
+    dirburst_duration_max = 0.5
+    dirburst_snr = 0.0
+    dirburst_color = 'white'
+
+    # Parse DirBurst specific arguments manually if present
+    for i, arg in enumerate(sys.argv):
+        if arg == '--dirburst-num-bursts' and i+1 < len(sys.argv):
+            dirburst_num_bursts = int(sys.argv[i+1])
+        elif arg == '--dirburst-duration-min' and i+1 < len(sys.argv):
+            dirburst_duration_min = float(sys.argv[i+1])
+        elif arg == '--dirburst-duration-max' and i+1 < len(sys.argv):
+            dirburst_duration_max = float(sys.argv[i+1])
+        elif arg == '--dirburst-snr' and i+1 < len(sys.argv):
+            dirburst_snr = float(sys.argv[i+1])
+        elif arg == '--dirburst-color' and i+1 < len(sys.argv):
+            dirburst_color = sys.argv[i+1]
+except:
+    # Default values if parsing fails
+    enable_dirburst = False
+    dirburst_num_bursts = 3
+    dirburst_duration_min = 0.3
+    dirburst_duration_max = 0.5
+    dirburst_snr = 0.0
+    dirburst_color = 'white'
 
 if (args.data_op == 'save_sig') | (args.data_op == 'save_RIR'):
 	# %% Dataset
@@ -68,13 +100,31 @@ if (args.data_op == 'save_sig') | (args.data_op == 'save_RIR'):
 		clean_silence = True)
 
 	# Noise signal
+	# Configure noise types and DirBurst parameters based on command line flags
+	if enable_dirburst and args.stage == 'test':
+		noise_types = ['dirburst']
+		dirburst_params = {
+			'duration_range': (dirburst_duration_min, dirburst_duration_max),
+			'num_bursts': dirburst_num_bursts,
+			'snr_db': dirburst_snr,
+			'max_tries': 50,
+			'color': dirburst_color,
+			'enabled': True
+		}
+		print(f"DirBurst enabled: {dirburst_num_bursts} bursts, duration {dirburst_duration_min}-{dirburst_duration_max}s, SNR {dirburst_snr}dB, color {dirburst_color}")
+	else:
+		noise_types = ['diffuse']
+		dirburst_params = {'enabled': False}
+		print("DirBurst disabled - using standard diffuse noise")
+
 	noiseDataset = at_dataset.NoiseDataset(
-		T = T, 
-		fs = fs, 
-		nmic = array_setup.mic_pos.shape[0], 
-		noise_type = Parameter(['diffuse'], discrete=True), 
-		noise_path = dirs['noisig_'+args.stage], 
-		c = speed)
+		T = T,
+		fs = fs,
+		nmic = array_setup.mic_pos.shape[0],
+		noise_type = Parameter(noise_types, discrete=True),
+		noise_path = dirs['noisig_'+args.stage],
+		c = speed,
+		dirburst_params = dirburst_params)
 
 	# Room acoustics
 	dataset = at_dataset.RandomMicSigDataset( 
@@ -162,6 +212,17 @@ elif (args.data_op == 'read_sig') | ( args.data_op == 'read_RIR'):
 	# 	print(acoustic_scene.RIR[0].shape)
 	
 
+# Usage examples for DirBurst:
+#
+# Enable DirBurst with default parameters:
+# python DataGeneration.py --stage test --enable-dirburst
+#
+# Enable DirBurst with custom parameters:
+# python DataGeneration.py --stage test --enable-dirburst --dirburst-num-bursts 5 --dirburst-snr -3.0 --dirburst-color pink
+#
+# Disable DirBurst (default):
+# python DataGeneration.py --stage test
+#
 # if __name__ == '__main__':
     # pass
 

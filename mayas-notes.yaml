@@ -1,0 +1,42 @@
+CUDA_VISIBLE_DEVICES=1  python RunSRPDNN.py --train --gen-on-the-fly
+CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --train --gen-on-the-fly --use-amp --gpu-id 1 --source-state static
+
+python RunSRPDNN.py --train --gen-on-the-fly --use-amp --gpu-id 0 --source-state static
+
+mirrowing dataset path:
+mkdir -p /home/mayavb/SRP-DNN/data/SrcSig
+ln -s /src/data/SrcSig/LibriSpeech \
+      /home/mayavb/SRP-DNN/data/SrcSig/LibriSpeech
+mkdir -p /home/mayavb/SRP-DNN/data/SrcSig
+
+mirrowing checkpoints path:
+mkdir -p /home/mayavb/SRP-DNN/exp
+ln -s /src/exp/01200846 /home/mayavb/SRP-DNN/exp/01200846
+
+CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --time 01081556 --source-state static --eval-mode simulate all --localize-mode IDL kNum 1 --sources 2 --gen-on-the-fly --use-amp
+CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --time 01081556 --source-state static --eval-mode simulate all --localize-mode IDL kNum 2 --sources 2 --gen-on-the-fly --use-amp
+
+run this:
+CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL unkNum 2 --sources 1 2
+CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+
+
+CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --enable-dirburst --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+CUDA_VISIBLE_DEVICES=0 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state mobile --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+
+
+
+dynamic:
+mkdir -p /home/mayavb/SRP-DNN/exp
+ln -s /src/exp/01200846 /home/mayavb/SRP-DNN/exp/01200846
+
+CUDA_VISIBLE_DEVICES=0 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01200846 --source-state mobile --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+
+
+
+SLURM:
+stand at /home/mayavb/PythonProjects/SRP-DNN/code
+sbatch myJob.sh
+dont forget to set the partition in myJob.sh
+dont forget to stand in the code folder when running sbatch

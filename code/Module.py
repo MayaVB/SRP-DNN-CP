@@ -117,7 +117,7 @@ class getMetric(nn.Module):
 		self.invlid_sidx = invalid_source_idx
 		self.eps = eps
 
-	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ae_mode, ae_TH=30, useVAD=True, vad_TH=[0.5,0.5], metric_unfold=False):
+	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False):
 		""" Args:
 				doa_gt, doa_est - (nb, nt, 2, ns) in degrees
 				vad_gt, vad_est - (nb, nt, ns) 
@@ -201,6 +201,13 @@ class getMetric(nn.Module):
 				vad_gt_sum = torch.reshape(vad_gt_one.sum(axis=1)>0, (nt, 1)).repeat((1, num_sources_est))
 				vad_est_one = vad_est_one * vad_gt_sum
 				K_est = vad_est_one.sum(axis=1)
+    
+				# Maya
+				# if b_idx == 0:
+				# 	print("DEBUG: K_gt.sum=", K_gt.sum().item(),
+				# 		"K_est.sum=", K_est.sum().item(),
+				# 		"gt_th=", vad_TH[0], "est_th=", vad_TH[1])
+    
 				for t_idx in range(nt):
 					num_gt = int(K_gt[t_idx].item())
 					num_est = int(K_est[t_idx].item())
@@ -232,9 +239,17 @@ class getMetric(nn.Module):
 								aziele_error[t_idx, src_idx] = dist_mat_azel[src_idx, assignment[src_idx]]
 
 				K_corr = corr_flag.sum(axis=1)
-				acc[b_idx, :] = K_corr.sum(axis=0) / K_gt.sum(axis=0)
-				mdr[b_idx, :] = (K_gt.sum(axis=0) - K_corr.sum(axis=0)) / K_gt.sum(axis=0)
-				far[b_idx, :] = (K_est.sum(axis=0) - K_corr.sum(axis=0)) / K_gt.sum(axis=0)
+				# acc[b_idx, :] = K_corr.sum(axis=0) / K_gt.sum(axis=0)
+				# mdr[b_idx, :] = (K_gt.sum(axis=0) - K_corr.sum(axis=0)) / K_gt.sum(axis=0)
+				# far[b_idx, :] = (K_est.sum(axis=0) - K_corr.sum(axis=0)) / K_gt.sum(axis=0)
+				# maya
+				den = K_gt.sum(axis=0) + self.eps
+				acc[b_idx, :] = K_corr.sum(axis=0) / den
+				mdr[b_idx, :] = (K_gt.sum(axis=0) - K_corr.sum(axis=0)) / den
+				far[b_idx, :] = (K_est.sum(axis=0) - K_corr.sum(axis=0)) / den
+    
+    
+    
 
 				mae_temp = []
 				rmse_temp = []

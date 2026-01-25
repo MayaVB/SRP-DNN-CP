@@ -8,7 +8,9 @@
 """
 import os
 from OptSRPDNN import opt
- 
+import matplotlib.pyplot as plt
+import numpy as np
+
 opts = opt()
 args = opts.parse()
 dirs = opts.dir()
@@ -24,7 +26,9 @@ import numpy as np
 import time
 import scipy.io
 
-from tensorboardX import SummaryWriter
+# from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
+
 import Dataset as at_dataset
 import LearnerSRPDNN as at_learner
 import ModelSRPDNN as at_model
@@ -99,13 +103,31 @@ if __name__ == "__main__":
 			noise_type = Parameter(['spatial_white'], discrete=True), 
 			noise_path = None, 
 			c = speed)
+		# Configure test noise dataset with DirBurst support
+		if args.enable_dirburst:
+			test_noise_type = ['dirburst']
+			test_dirburst_params = {
+				'duration_range': (args.dirburst_duration_min, args.dirburst_duration_max),
+				'num_bursts': args.dirburst_num_bursts,
+				'snr_db': args.dirburst_snr,
+				'max_tries': 50,
+				'color': args.dirburst_color,
+				'enabled': True
+			}
+			print(f"DirBurst enabled for testing: {args.dirburst_num_bursts} bursts, duration {args.dirburst_duration_min}-{args.dirburst_duration_max}s, SNR {args.dirburst_snr}dB, color {args.dirburst_color}")
+		else:
+			test_noise_type = ['spatial_white']
+			test_dirburst_params = {'enabled': False}
+			print("DirBurst disabled - using spatial white noise for testing")
+
 		noiseDataset_test = at_dataset.NoiseDataset(
-			T = T, 
-			fs = fs, 
-			nmic = array_setup.mic_pos.shape[0], 
-			noise_type = Parameter(['spatial_white'], discrete=True), 
-			noise_path = None, 
-			c = speed)
+			T = T,
+			fs = fs,
+			nmic = array_setup.mic_pos.shape[0],
+			noise_type = Parameter(test_noise_type, discrete=True),
+			noise_path = None,
+			c = speed,
+			dirburst_params = test_dirburst_params)
 
 	# Segmenting, STFT parameters
 	# When win_shift_ratio = 0.5, then the number of time frames corresponding to one segment can be set to an integer
@@ -282,8 +304,9 @@ if __name__ == "__main__":
 		method_mode = args.localize_mode[0]
 		source_num_mode = args.localize_mode[1]
 		
-		# Metric
-		metric_setting = {'ae_mode':['azi', 'ele'], 'ae_TH':30, 'useVAD':True, 'vad_TH':[2/3, 0.3],'metric_unfold':True}
+		# Metric Maya
+		# metric_setting = {'ae_mode':['azi', 'ele'], 'ae_TH':30, 'useVAD':True, 'vad_TH':[2/3, 0.3],'metric_unfold':True}
+		metric_setting = {'ae_mode':['azi', 'ele'], 'ae_TH':30, 'useVAD':False, 'vad_TH':[2/3, 0.3],'metric_unfold':True}
 		nmetric = 3 + len(metric_setting['ae_mode']) * 2
 
 		# Load model
@@ -301,8 +324,9 @@ if __name__ == "__main__":
 
 			# %% Analyze results
 			if ins_mode == 'all':
-				T60 = np.array((0.2, 0.6, 1)) # Reverberation times to analyze
-				SNR = np.array((5, 10, 15))  # SNRs to analyze
+				T60 = np.array((0.2, 1)) # Reverberation times to analyze
+				SNR = np.array((5, 30))  # SNRs to analyze
+				# SNR = np.array((5, 15, 30))  # SNRs to analyze
 				dataset_test.dataset_sz = 10
 				
 			elif ins_mode == 'some':
@@ -310,7 +334,7 @@ if __name__ == "__main__":
 				SNR = np.array((5,))  	# SNRs to analyze
 				dataset_test.dataset_sz = 2
 				ins_idx = 1
-
+    
 			metrics = np.zeros((nmetric, len(T60), len(SNR)))
 			metrics_woDNN = np.zeros((nmetric, len(T60), len(SNR)))
 			for i in range(len(T60)):
@@ -321,7 +345,36 @@ if __name__ == "__main__":
 					set_random_seed(args.seed)
 					dataloader_test = torch.utils.data.DataLoader(dataset=dataset_test, batch_size=args.bs[2], shuffle=False, **kwargs)
 					pred, gt, mic_sig = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=True)
-					pred_woDNN, _, = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
+#					pred_woDNN, _, = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
+					pred_woDNN, _, _ = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
+
+					# Maya fix: 
+					# In simulate mode, learner.predict() returns lists of batches (pred, gt, mic_sig).
+					# But below code expects concatenated dict/tensors (e.g., gt['doa']).
+					# So i concatenate here to match the rest of the scenarios
+					def _concat_predgt(x):
+						"""Concatenate list-of-batches into a single tensor/dict-of-tensors."""
+						if isinstance(x, list):
+							if len(x) == 0:
+								return x
+							if isinstance(x[0], dict):
+								# dict of tensors per batch -> dict of concatenated tensors
+								return {k: torch.cat([xb[k] for xb in x], dim=0) for k in x[0].keys()}
+							else:
+								# list of tensors -> concatenated tensor
+								return torch.cat(x, dim=0)
+						return x
+
+					pred       = _concat_predgt(pred)
+					gt         = _concat_predgt(gt)
+					mic_sig    = _concat_predgt(mic_sig)
+					pred_woDNN = _concat_predgt(pred_woDNN)
+
+     				# debug
+					# print("vad_pred min/max:", pred['vad_sources'].min().item(), pred['vad_sources'].max().item())
+					# print("vad_gt unique:", torch.unique(gt['vad_sources']))
+					# print("gt vad mean:", gt['vad_sources'].float().mean().item(),
+					# 	"unique:", torch.unique(gt['vad_sources']).detach().cpu())
 
 					metrics[:, i, j], metric_keys = learner.evaluate(pred=pred, gt=gt, metric_setting=metric_setting)					
 					metrics_woDNN[:, i, j], _ = learner.evaluate(pred=pred_woDNN, gt=gt, metric_setting=metric_setting)
@@ -338,6 +391,149 @@ if __name__ == "__main__":
 
 					time_stamp = np.arange(seg_len / 2, T * fs - seg_len / 2 + 1, seg_shift)
 					time_stamp = np.array(time_stamp) / fs
+
+					# %% Mayas HEATMAP PLOTS
+					plot_ins_idx = ins_idx if ins_mode == "some" else 0   # in 'all' mode: plot first item (change later)
+
+					# per-instance views
+					doa_gt_ins = doa_gt[plot_ins_idx]     # (nt_gt, 2, ns_gt)
+					doa_pr_ins = doa_pred[plot_ins_idx]   # (nt_pr, 2, ns_pr)
+					ss_ins     = ss_pred[plot_ins_idx]    # (nt_ss, nele, nazi)
+
+					# choose time index
+					t_gt = 0
+					t_pr = 0
+
+					# Guard
+					if doa_gt_ins.ndim != 3 or doa_pr_ins.ndim != 3 or ss_ins.ndim != 3:
+						print("WARN: unexpected shapes for plotting:",
+							"doa_gt_ins", getattr(doa_gt_ins, "shape", None),
+							"doa_pr_ins", getattr(doa_pr_ins, "shape", None),
+							"ss_ins", getattr(ss_ins, "shape", None))
+					else:
+						gt_el = doa_gt_ins[t_gt, 0, :]
+						gt_az = doa_gt_ins[t_gt, 1, :]
+
+						est_el = doa_pr_ins[t_pr, 0, :]
+						est_az = doa_pr_ins[t_pr, 1, :]
+
+						print("doa_gt_ins shape:", doa_gt_ins.shape, "doa_pr_ins shape:", doa_pr_ins.shape)
+
+						print("GT AZ (first 10 frames):",
+							[doa_gt_ins[t, 1, :].tolist() for t in range(min(10, doa_gt_ins.shape[0]))])
+
+						print("GT EL (first 10 frames):",
+							[doa_gt_ins[t, 0, :].tolist() for t in range(min(10, doa_gt_ins.shape[0]))])
+
+						print("EST AZ (first 10 frames):",
+							[doa_pr_ins[t, 1, :].tolist() for t in range(min(10, doa_pr_ins.shape[0]))])
+
+						print("EST EL (first 10 frames):",
+							[doa_pr_ins[t, 0, :].tolist() for t in range(min(10, doa_pr_ins.shape[0]))])
+
+						ss_map = ss_ins.mean(axis=0)   # (nele, nazi)
+						nele, nazi = ss_map.shape
+
+						el_grid = np.linspace(0.0, 180.0, nele)
+						az_grid = np.linspace(-180.0, 180.0, nazi, endpoint=False)
+
+						plt.figure(figsize=(7.2, 3.6))
+						plt.imshow(
+							ss_map,
+							origin="lower",
+							aspect="auto",
+							extent=[az_grid[0], az_grid[-1], el_grid[0], el_grid[-1]],
+							cmap="jet",
+						)
+
+						plt.scatter(gt_az, gt_el, c="k", marker="x", s=90, linewidths=2.0, label="GT")
+						plt.scatter(est_az, est_el, facecolors="white", edgecolors="k",
+									marker="o", s=65, linewidths=1.2, label="EST")
+
+						plt.xlabel("Azimuth [°]")
+						plt.ylabel("Elevation [°]")
+						plt.title(f"{method_mode} {source_num_mode} | RT60={T60[i]}s | SNR={SNR[j]}dB | ins={plot_ins_idx}")
+						plt.colorbar()
+						plt.legend(loc="upper right")
+						plt.tight_layout()
+
+						outname = (
+							f"{result_dir}/plots/HEATMAP_{method_mode}_{source_num_mode}"
+							f"_RT{int(T60[i]*1000)}_SNR{SNR[j]}_ins{plot_ins_idx}.jpg"
+						)
+						plt.savefig(outname, dpi=200)
+						plt.close()
+						print("Saved:", outname)
+
+					# END HEATMAP PLOTS
+					# Maya- hist plot Flatten over time and sources
+					est_az_all = doa_pr_ins[:, 1, :].reshape(-1)   # (nt_pr * ns_pr,)
+					est_el_all = doa_pr_ins[:, 0, :].reshape(-1)
+
+					# Remove invalid / NaN just in case
+					est_az_all = est_az_all[np.isfinite(est_az_all)]
+					est_el_all = est_el_all[np.isfinite(est_el_all)]
+
+					# ---- Ground truth from doa_gt_ins (shape = (1, 2, 2)) ----
+					gt_el_all = doa_gt_ins[0, 0, :]   # (ns_pr,)
+					gt_az_all = doa_gt_ins[0, 1, :]   # (ns_pr,)
+
+					plt.figure(figsize=(10, 3.8))
+
+					# --- Azimuth histogram ---
+					plt.subplot(1, 2, 1)
+					plt.hist(est_az_all, bins=72, range=(-180, 180),
+							color="steelblue", alpha=0.85)
+
+					# GT azimuth lines (one per source)
+					for k, az in enumerate(gt_az_all):
+						plt.axvline(float(az), color="red", linestyle="--",
+									linewidth=2, alpha=0.8,
+									label="GT" if k == 0 else None)
+
+					plt.xlabel("Azimuth [°]")
+					plt.ylabel("Count")
+					plt.title("EST Azimuth histogram")
+					plt.legend()
+
+					# --- Elevation histogram ---
+					plt.subplot(1, 2, 2)
+					plt.hist(est_el_all, bins=36, range=(0, 180),
+							color="darkorange", alpha=0.85)
+
+					# GT elevation lines (one per source)
+					for k, el in enumerate(gt_el_all):
+						plt.axvline(float(el), color="red", linestyle="--",
+									linewidth=2, alpha=0.8,
+									label="GT" if k == 0 else None)
+
+					plt.xlabel("Elevation [°]")
+					plt.ylabel("Count")
+					plt.title("EST Elevation histogram")
+					plt.legend()
+
+					# --- Super title with GT info included ---
+					gt_az_str = ", ".join([f"{az:.1f}°" for az in gt_az_all])
+					gt_el_str = ", ".join([f"{el:.1f}°" for el in gt_el_all])
+
+					plt.suptitle(
+						f"{method_mode} {source_num_mode} | RT60={T60[i]}s | "
+						f"SNR={SNR[j]}dB | ins={plot_ins_idx}\n"
+						f"GT Az = [{gt_az_str}] , GT El = [{gt_el_str}]",
+						fontsize=11
+					)
+
+					plt.tight_layout(rect=[0, 0.02, 1, 0.92])
+
+					outname_hist = (
+						f"{result_dir}/plots/HIST_{method_mode}_{source_num_mode}"
+						f"_RT{int(T60[i]*1000)}_SNR{SNR[j]}_ins{plot_ins_idx}.jpg"
+					)
+					plt.savefig(outname_hist, dpi=200)
+					plt.close()
+					print("Saved:", outname_hist)
+
+
 
 					# %% Save analyzed results
 					if save_result_flag:
@@ -362,7 +558,7 @@ if __name__ == "__main__":
 										'sensig':sensig, 'fs':fs, 'time': time_stamp, 
 										'DOA': doa, 'VAD': vad, 
 										'DOA_pred': doa_pred_woDNN, 'VAD_pred': vad_pred_woDNN, 'SS_pred': ss_pred_woDNN})
-
+    
 			if ins_mode == 'all':
 				scipy.io.savemat(result_dir + '/metric_' + source_num_mode + '_NS' + str(args.sources[-1]) + '.mat', 
 					{'metric': metrics, 'SNR': SNR, 'T60': T60, 'metric_key': metric_keys})
@@ -504,3 +700,118 @@ if __name__ == "__main__":
 							
 							savename = result_dir + '/' + method_mode + '_' + source_num_mode + '_DOAvis_task' + str(task[0]) + '_' + str(ins_idx+1)
 							vis.savefig(savename)
+       
+       
+       
+       
+       
+       
+					#  MAYA HEATMAP PLOTS (SOME + ALL)
+					# from scipy.optimize import linear_sum_assignment
+
+					# def wrap_az_err(a, b):
+					# 	return abs(((a - b + 180.0) % 360.0) - 180.0)
+
+					# def fmt_metric(vec):
+					# 	vec = vec.tolist()
+					# 	if len(vec) == 7:
+					# 		ACC, MDR, FAR, MAE_azi, MAE_ele, RMSE_azi, RMSE_ele = vec
+					# 		return (f"ACC={ACC:.2f} MDR={MDR:.2f} FAR={FAR:.2f}\n"
+					# 				f"MAE(ele,azi)=({MAE_azi:.1f},{MAE_ele:.1f})\n"
+					# 				f"RMSE(ele,azi)=({RMSE_azi:.1f},{RMSE_ele:.1f})")
+					# 	return f"metric len={len(vec)}"
+
+					# # how many instances to plot when ins_mode == 'all'
+					# PLOT_K = 4  # change to 1/2/5 as you like
+
+					# # Determine nb from doa_gt
+					# nb = doa_gt.shape[0]
+
+					# if ins_mode == 'some':
+					# 	plot_indices = [ins_idx]  # exactly the one you chose
+					# else:
+					# 	plot_indices = list(range(min(PLOT_K, nb)))  # first K instances
+
+					# for plot_ins_idx in plot_indices:
+
+					# 	doa_gt_ins = doa_gt[plot_ins_idx]      # (nt_gt, 2, ns_gt)
+					# 	doa_pr_ins = doa_pred[plot_ins_idx]    # (nt_pr, 2, ns_pr)
+					# 	ss_ins     = ss_pred[plot_ins_idx]     # (nt_ss, nele, nazi)
+
+					# 	# choose time index for markers (static: nt_gt=1 anyway)
+					# 	t_gt = 0
+					# 	t_pr = 0
+
+					# 	gt_el = doa_gt_ins[t_gt, 0, :]
+					# 	gt_az = doa_gt_ins[t_gt, 1, :]
+
+					# 	est_el = doa_pr_ins[t_pr, 0, :]
+					# 	est_az = doa_pr_ins[t_pr, 1, :]
+
+					# 	# Hungarian reorder EST to match GT (plotting only)
+					# 	ns_gt = gt_az.shape[0]
+					# 	ns_pr = est_az.shape[0]
+					# 	C = np.zeros((ns_gt, ns_pr), dtype=np.float32)
+					# 	for g in range(ns_gt):
+					# 		for p in range(ns_pr):
+					# 			C[g, p] = wrap_az_err(est_az[p], gt_az[g]) + abs(est_el[p] - gt_el[g])
+
+					# 	g_idx, p_idx = linear_sum_assignment(C)
+
+					# 	est_el_re = np.full((ns_gt,), np.nan, dtype=np.float32)
+					# 	est_az_re = np.full((ns_gt,), np.nan, dtype=np.float32)
+					# 	for gi, pi in zip(g_idx, p_idx):
+					# 		est_el_re[gi] = est_el[pi]
+					# 		est_az_re[gi] = est_az[pi]
+
+					# 	# spectrum mean over time
+					# 	ss_map = ss_ins.mean(axis=0)  # (nele, nazi)
+					# 	nele, nazi = ss_map.shape
+					# 	el_grid = np.linspace(0.0, 180.0, nele)
+					# 	az_grid = np.linspace(-180.0, 180.0, nazi, endpoint=False)
+
+					# 	# metrics text for this (T60,SNR) cell
+					# 	txt_w  = fmt_metric(metrics[:, i, j])
+					# 	txt_wo = fmt_metric(metrics_woDNN[:, i, j])
+
+					# 	# plot
+					# 	plt.figure(figsize=(6.8, 3.4))
+					# 	plt.imshow(
+					# 		ss_map,
+					# 		origin="lower",
+					# 		aspect="auto",
+					# 		extent=[az_grid[0], az_grid[-1], el_grid[0], el_grid[-1]],
+					# 		cmap="jet",
+					# 	)
+					# 	plt.scatter(gt_az, gt_el, c="k", marker="x", s=90, linewidths=2.0, label="GT")
+					# 	plt.scatter(est_az_re, est_el_re, facecolors="white", edgecolors="k",
+					# 				marker="o", s=65, linewidths=1.2, label="EST")
+
+					# 	plt.xlabel("Azimuth [°]")
+					# 	plt.ylabel("Elevation [°]")
+					# 	plt.title(f"{method_mode}-{source_num_mode} | RT60={T60[i]}s SNR={SNR[j]}dB | ins={plot_ins_idx}")
+					# 	plt.colorbar()
+					# 	plt.legend(loc="upper right")
+
+					# 	# metric box
+					# 	plt.gcf().text(
+					# 		0.02, 0.02,
+					# 		"wDNN:\n"+txt_w+"\n\nwoDNN:\n"+txt_wo,
+					# 		fontsize=9, va="bottom", ha="left",
+					# 		bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.5")
+					# 	)
+
+					# 	plt.tight_layout()
+
+					# 	# filename: include mode, RT, SNR, instance
+					# 	tag = "SOME" if ins_mode == "some" else "ALL"
+					# 	outname = (f"{result_dir}/plots/HEAT_{tag}_{method_mode}_{source_num_mode}"
+					# 			f"_RT{int(T60[i]*1000)}_SNR{int(SNR[j])}_ins{plot_ins_idx}.jpg")
+					# 	plt.savefig(outname, dpi=200)
+					# 	plt.close()
+					# 	print("Saved:", outname)
+     
+					# choose instance index to plot
+     
+					# MAYA - HEATMAP PLOT
+					# choose instance index to plot

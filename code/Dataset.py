@@ -4,6 +4,7 @@ import math
 import scipy
 import scipy.io
 import scipy.signal
+from scipy.signal import lfilter
 import random
 # import librosa # for data generation, test which one (scipy.signal.resample_poly, librosa.resample) is faster
 import soundfile
@@ -46,6 +47,31 @@ def acoustic_power(s):
 	window_power = np.mean(S ** 2, axis=-1)
 	th = 0.01 * window_power.max()  # Threshold for silent detection
 	return np.mean(window_power[np.nonzero(window_power > th)])
+
+def _sample_noise_source_position(room_sz, array_pos):
+	""" Sample a random position in the room for directional noise burst.
+	"""
+	src_pos_min = np.array([0.1, 0.1, 0.1])
+	src_pos_max = room_sz - np.array([0.1, 0.1, 0.1])
+	src_pos = src_pos_min + np.random.random(3) * (src_pos_max - src_pos_min)
+	return src_pos
+
+def _make_noise_burst(length, fs, color="white"):
+	""" Generate a noise burst of specified length and color.
+	"""
+	if color == "white":
+		return np.random.randn(length).astype(np.float32)
+	elif color == "pink":
+		# Simple pink noise approximation using frequency domain filtering
+		white = np.random.randn(length)
+		freqs = np.fft.fftfreq(length, 1/fs)
+		freqs[0] = 1e-10  # Avoid division by zero
+		H = 1 / np.sqrt(np.abs(freqs))
+		H[0] = 1
+		pink_fft = np.fft.fft(white) * H
+		return np.real(np.fft.ifft(pink_fft)).astype(np.float32)
+	else:
+		return np.random.randn(length).astype(np.float32)
 
 
 # %% Util classes
@@ -256,8 +282,8 @@ miniDSP_array_setup = ArraySetup(arrayType='planar',
 class AcousticScene:
 	""" Acoustic scene class.
 	"""
-	def __init__(self, room_sz, T60, beta, noise_signal, SNR, source_signal, fs, array_setup, mic_pos, timestamps, traj_pts, 
-				 trajectory, t, DOA, c=343.0):
+	def __init__(self, room_sz, T60, beta, noise_signal, SNR, source_signal, fs, array_setup, mic_pos, timestamps, traj_pts,
+				 trajectory, t, DOA, c=343.0, noiseDataset=None):
 		self.room_sz = room_sz				# Room size
 		self.T60 = T60						# Reverberation time of the simulated room
 		self.beta = beta					# Reflection coefficients of the walls of the room (make sure it corresponds with T60)
@@ -272,7 +298,8 @@ class AcousticScene:
 		self.trajectory = trajectory		# Continuous trajectory (nsample,3,nsource)
 		self.t = t							# Continuous time (nsample)
 		self.DOA = DOA 						# Continuous DOA (nsample,3,nsource)
-		self.c = c 							# Speed of sound 
+		self.c = c 							# Speed of sound
+		self.noiseDataset = noiseDataset	# Optional noise dataset for DirBurst functionality 
  
 	def simulate(self):
 		""" Get the array recording using gpuRIR to perform the acoustic simulations.
@@ -366,6 +393,11 @@ class AcousticScene:
 		# 	mic_signals_sources = mic_signals_sources/value
 		# 	dp_mic_signals_sources = dp_mic_signals_sources/value
 		# 	# raise Exception("Value of microphone signals is out of range [-1, 1]")
+
+		# Apply DirBurst if applicable (test time only)
+		if hasattr(self, 'noiseDataset') and self.noiseDataset is not None:
+			mic_signals = self.noiseDataset.apply_dirburst_if_enabled(
+				mic_signals.T, self.room_sz, self.mic_pos, self.T60).T
 
 		return mic_signals
 	
@@ -526,15 +558,28 @@ class LibriSpeechDataset(Dataset):
 
 # %% Noise signal Datasets
 class NoiseDataset():
-	def __init__(self, T, fs, nmic, noise_type, noise_path=None, c=343.0):
+	def __init__(self, T, fs, nmic, noise_type, noise_path=None, c=343.0,
+				 dirburst_params=None):
 		self.T = T
 		self.fs= fs
 		self.nmic = nmic
-		self.noise_type = noise_type # ? 'diffuse' and 'real_world' cannot exist at the same time
-		# self.mic_pos = mic_pos # valid for 'diffuse'  
+		self.noise_type = noise_type # supports 'diffuse', 'real_world', 'spatial_white', 'dirburst'
+		# self.mic_pos = mic_pos # valid for 'diffuse'
 		if noise_path != None:
 			_, self.path_set = self._exploreCorpus(noise_path, 'wav') # valid for 'diffuse' and 'real-world'
 		self.c = c
+
+		# DirBurst parameters (only used when noise_type includes 'dirburst')
+		if dirburst_params is None:
+			dirburst_params = {
+				'duration_range': (0.3, 0.5),
+				'num_bursts': 3,
+				'snr_db': 0.0,
+				'max_tries': 50,
+				'color': 'white',
+				'enabled': False  # disabled by default
+			}
+		self.dirburst_dataset = DirBurstDataset(**dirburst_params)
 
 	def get_random_noise(self, mic_pos=None, eps=1e-5):
 		noise_type = self.noise_type.getValue()
@@ -571,7 +616,7 @@ class NoiseDataset():
 			nmic = noise.shape[-1]
 			if nmic != self.nmic:
 				raise Exception('Unexpected number of microphone channels')
-		
+
 			nsample_desired = int(self.T * fs)
 			noise_copy = copy.deepcopy(noise)
 			nsample = noise.shape[0]
@@ -589,10 +634,42 @@ class NoiseDataset():
 				# noise_signal = librosa.resample(noise_copy.transpose(1,0), orig_sr = fs, target_sr = self.fs).transpose(1,0)
 			noise_signal = noise_signal/(np.max(noise_signal)+eps)
 
+		elif noise_type == 'dirburst':
+			# For DirBurst, we return low-level background noise
+			# The actual directional bursts are applied later in post-processing
+			noise_signal = self.gen_Gaussian_noise(self.T, self.fs, self.nmic) * 0.01  # Very low level
+
 		else:
 			raise Exception('Unknown noise type specified')
 
 		return noise_signal
+
+	def apply_dirburst_if_enabled(self, mic_signals, room_sz, mic_pos, T60):
+		""" Apply directional noise bursts if enabled and noise_type is 'dirburst'.
+		This should be called during test time after the main simulation.
+		"""
+		if (hasattr(self, 'dirburst_dataset') and
+			self.dirburst_dataset.enabled and
+			self.noise_type.getValue() == 'dirburst'):
+
+			return self.dirburst_dataset.inject_directional_noise_bursts(
+				mic_signals, self.fs, room_sz, mic_pos, T60)
+		return mic_signals
+
+	def enable_dirburst(self, enabled=True, **params):
+		""" Enable or disable DirBurst functionality at test time.
+
+		Args:
+			enabled: Boolean to enable/disable DirBurst
+			**params: Optional parameters to update DirBurst settings
+					 (duration_range, num_bursts, snr_db, max_tries, color)
+		"""
+		if hasattr(self, 'dirburst_dataset'):
+			self.dirburst_dataset.enabled = enabled
+			# Update parameters if provided
+			for key, value in params.items():
+				if hasattr(self.dirburst_dataset, key):
+					setattr(self.dirburst_dataset, key, value)
 
 	def _exploreCorpus(self, path, file_extension):
 		directory_tree = {}
@@ -725,6 +802,117 @@ class NoiseDataset():
 		plt.title(str(1))
 		# plt.show()
 		plt.savefig('sc')
+
+
+class DirBurstDataset():
+	""" Dataset for applying directional noise bursts at test time.
+	"""
+	def __init__(self, duration_range=(0.3, 0.5), num_bursts=3, snr_db=0.0,
+				 max_tries=50, color="white", enabled=True):
+		self.duration_range = duration_range
+		self.num_bursts = num_bursts
+		self.snr_db = snr_db
+		self.max_tries = max_tries
+		self.color = color
+		self.enabled = enabled
+
+	def inject_directional_noise_bursts(self, rev_signals, fs, room_sz, mic_pos, T60):
+		""" Add directional noise bursts to existing microphone signals.
+
+		Args:
+			rev_signals: [M, T] float32 microphone signals
+			fs: sampling frequency
+			room_sz: room dimensions [x, y, z]
+			mic_pos: microphone positions [M, 3]
+			T60: reverberation time
+
+		Returns:
+			Modified rev_signals with directional noise bursts
+		"""
+		if not self.enabled:
+			return rev_signals
+
+		M, T = rev_signals.shape
+
+		# Convert to correct format if needed
+		if rev_signals.shape[0] != M:
+			rev_signals = rev_signals.T
+			M, T = rev_signals.shape
+
+		for _ in range(self.num_bursts):
+			# burst length
+			dur = float(np.random.uniform(self.duration_range[0], self.duration_range[1]))
+			L = int(max(1, round(dur * fs)))
+			if L >= T:
+				continue
+
+			# choose start so the whole burst fits
+			tries = 0
+			start = None
+			while tries < self.max_tries:
+				candidate = np.random.randint(0, T - L)
+				start = candidate
+				break
+			if start is None:
+				continue
+
+			# pick a directional point & make per-mic burst via RIRs
+			array_pos = np.mean(mic_pos, axis=0)  # center of array
+			src_pos = _sample_noise_source_position(room_sz, array_pos)
+
+			# Generate simple RIRs for directional burst
+			burst_mics = self._generate_directional_burst(src_pos, mic_pos, room_sz,
+														  T60, L, fs)
+
+			# Compute gain for target SNR (use all mics jointly over the window)
+			seg = rev_signals[:, start:start+L]
+			sig_rms = float(np.sqrt(np.mean(seg**2)) + 1e-12)
+			noise_rms = float(np.sqrt(np.mean(burst_mics**2)) + 1e-12)
+			gain = sig_rms / (noise_rms * (10.0**(self.snr_db/20.0)))
+			seg += gain * burst_mics
+			rev_signals[:, start:start+L] = seg
+
+		return rev_signals
+
+	def _generate_directional_burst(self, src_pos, mic_pos, room_sz, T60, L, fs):
+		""" Generate directional noise burst using simplified RIR simulation.
+		"""
+		M = mic_pos.shape[0]
+		burst_mics = np.zeros((M, L), dtype=np.float32)
+
+		# Generate burst signal
+		burst_mono = _make_noise_burst(L, fs, color=self.color)
+
+		# Simple distance-based attenuation and delay for each microphone
+		for m in range(M):
+			# Calculate distance and delay
+			distance = np.linalg.norm(src_pos - mic_pos[m])
+			delay_samples = int(distance / 343.0 * fs)  # speed of sound = 343 m/s
+
+			# Apply distance attenuation (1/r law)
+			attenuation = 1.0 / max(distance, 0.1)
+
+			# Apply delay and attenuation
+			if delay_samples < L:
+				delayed_burst = np.zeros(L)
+				delayed_burst[delay_samples:] = burst_mono[:L-delay_samples] * attenuation
+
+				# Simple reverberation tail (exponential decay)
+				if T60 > 0:
+					decay_constant = 3.0 / T60  # -60dB in T60 seconds
+					reverb_tail_length = min(int(T60 * fs), L - delay_samples)
+					if reverb_tail_length > 0:
+						reverb = np.random.randn(reverb_tail_length) * 0.1 * attenuation
+						reverb *= np.exp(-decay_constant * np.arange(reverb_tail_length) / fs)
+						end_idx = min(delay_samples + reverb_tail_length, L)
+						delayed_burst[delay_samples:end_idx] += reverb[:end_idx-delay_samples]
+
+				burst_mics[m] = delayed_burst
+			else:
+				# Source is too far, minimal contribution
+				burst_mics[m] = np.zeros(L) * 0.001 * attenuation
+
+		return burst_mics
 
 
 ## %% Microphone Signal Datasets
@@ -978,7 +1166,8 @@ class RandomMicSigDataset(Dataset):
 			t = t,
 			trajectory = trajectory,
 			DOA = DOA,
-			c = self.c 
+			c = self.c,
+			noiseDataset = self.noiseDataset  # Pass noiseDataset for DirBurst functionality
 		)
 		acoustic_scene.source_vad = vad[:,0:num_source].astype(bool) # a mask
 

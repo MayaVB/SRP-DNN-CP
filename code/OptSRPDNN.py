@@ -37,6 +37,14 @@ class opt():
         # parser.add_argument('--array', type=str, default='12ch', metavar='ArrayType', help='Type of microphone array (default: 12ch)')
         parser.add_argument('--gen-on-the-fly', action='store_true', default=False, help='Generate microphone signals on-the-fly (default: False)')
 
+        # DirBurst noise parameters
+        parser.add_argument('--enable-dirburst', action='store_true', default=False, help='Enable directional noise bursts during test (default: False)')
+        parser.add_argument('--dirburst-num-bursts', type=int, default=3, metavar='N', help='Number of directional noise bursts (default: 3)')
+        parser.add_argument('--dirburst-duration-min', type=float, default=0.3, metavar='D', help='Minimum duration of noise bursts in seconds (default: 0.3)')
+        parser.add_argument('--dirburst-duration-max', type=float, default=0.5, metavar='D', help='Maximum duration of noise bursts in seconds (default: 0.5)')
+        parser.add_argument('--dirburst-snr', type=float, default=0.0, metavar='SNR', help='SNR of directional noise bursts in dB (default: 0.0)')
+        parser.add_argument('--dirburst-color', type=str, default='white', choices=['white', 'pink'], metavar='COLOR', help='Color of directional noise bursts (default: white)')
+
         # for training stage
         parser.add_argument('--bs', type=int, nargs='+', default=[1,1,1], metavar='TrainValTestBatch', help='batch size for training, validation and test (default: 1, 1, 1)')
         parser.add_argument('--epochs', type=int, default=20, metavar='Epoch', help='number of epochs to train (default: 18)')
@@ -51,17 +59,15 @@ class opt():
         return args
         
     def dir(self):
-        """ Function: Get directories of code, data and experimental results
-        """ 
-        work_dir = r'~'
+        """ Function: Get directories of code, data and experimental results """
+        work_dir = os.environ.get("SRPDNN_WORKDIR", r'~')
         work_dir = os.path.abspath(os.path.expanduser(work_dir))
         dirs = {}
 
         dirs['code'] = work_dir + '/SRP-DNN/code'
         dirs['data'] = work_dir + '/SRP-DNN/data'
-        # dirs['data'] = work_dir + '/data'
         dirs['gerdata'] = work_dir + '/SRP-DNN/data'
-        dirs['exp'] = work_dir + '/SRP-DNN/exp'
+        dirs['exp']  = work_dir + '/SRP-DNN/exp'
         
         # signal data
         dirs['sousig_train'] = dirs['data'] + '/SrcSig/LibriSpeech/train-clean-100'
