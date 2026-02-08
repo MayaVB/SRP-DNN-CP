@@ -13,6 +13,15 @@ parser.add_argument('--gpu-id', type=str, default='7', metavar='GPU', help='GPU 
 parser.add_argument('--sources', type=int, nargs='+', default=[1, 2], metavar='Sources', help='number of sources (default: 1, 2)')
 parser.add_argument('--source-state', type=str, default='mobile', metavar='SourceState', help='state of sources (default: Mobile)')
 parser.add_argument('--data-op', type=str, default='save_sig', metavar='DataOp', help='operation for generated data (default: Save signal)') # ['save_sig', 'save_RIR', 'read_sig', 'read_RIR']
+
+# DirBurst arguments
+parser.add_argument('--enable-dirburst', action='store_true', help='enable directional noise bursts')
+parser.add_argument('--dirburst-num-bursts', type=int, default=3, help='number of directional noise bursts (default: 3)')
+parser.add_argument('--dirburst-duration-min', type=float, default=0.3, help='minimum burst duration in seconds (default: 0.3)')
+parser.add_argument('--dirburst-duration-max', type=float, default=0.5, help='maximum burst duration in seconds (default: 0.5)')
+parser.add_argument('--dirburst-snr', type=float, default=0.0, help='SNR of burst noise in dB (default: 0.0)')
+parser.add_argument('--dirburst-color', type=str, default='white', choices=['white', 'pink'], help='color of burst noise (default: white)')
+
 args = parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
@@ -25,36 +34,13 @@ import Dataset as at_dataset
 opts = opt()
 dirs = opts.dir()
 
-# Try to get DirBurst arguments if available, otherwise use defaults
-try:
-    import sys
-    enable_dirburst = '--enable-dirburst' in sys.argv
-    dirburst_num_bursts = 3
-    dirburst_duration_min = 0.3
-    dirburst_duration_max = 0.5
-    dirburst_snr = 0.0
-    dirburst_color = 'white'
-
-    # Parse DirBurst specific arguments manually if present
-    for i, arg in enumerate(sys.argv):
-        if arg == '--dirburst-num-bursts' and i+1 < len(sys.argv):
-            dirburst_num_bursts = int(sys.argv[i+1])
-        elif arg == '--dirburst-duration-min' and i+1 < len(sys.argv):
-            dirburst_duration_min = float(sys.argv[i+1])
-        elif arg == '--dirburst-duration-max' and i+1 < len(sys.argv):
-            dirburst_duration_max = float(sys.argv[i+1])
-        elif arg == '--dirburst-snr' and i+1 < len(sys.argv):
-            dirburst_snr = float(sys.argv[i+1])
-        elif arg == '--dirburst-color' and i+1 < len(sys.argv):
-            dirburst_color = sys.argv[i+1]
-except:
-    # Default values if parsing fails
-    enable_dirburst = False
-    dirburst_num_bursts = 3
-    dirburst_duration_min = 0.3
-    dirburst_duration_max = 0.5
-    dirburst_snr = 0.0
-    dirburst_color = 'white'
+# Get DirBurst arguments from parsed args
+enable_dirburst = args.enable_dirburst
+dirburst_num_bursts = args.dirburst_num_bursts
+dirburst_duration_min = args.dirburst_duration_min
+dirburst_duration_max = args.dirburst_duration_max
+dirburst_snr = args.dirburst_snr
+dirburst_color = args.dirburst_color
 
 if (args.data_op == 'save_sig') | (args.data_op == 'save_RIR'):
 	# %% Dataset
@@ -67,7 +53,8 @@ if (args.data_op == 'save_sig') | (args.data_op == 'save_RIR'):
 		set_seed(10001)
 
 	elif args.stage == 'test':
-		data_num = 2560
+		#data_num = 2560
+		data_num = 250
 		set_seed(10002)
 
 	else:
@@ -148,11 +135,16 @@ if (args.data_op == 'save_sig') | (args.data_op == 'save_RIR'):
 
 	# Data generation
 	if args.data_op == 'save_sig':
-		save_dir = dirs['sensig_'+args.stage]
+		if enable_dirburst:
+			save_dir = dirs['sensig_'+args.stage] + '_burstV2'
+		else:
+			save_dir = dirs['sensig_'+args.stage]
 		exist_temp = os.path.exists(save_dir)
 		if exist_temp==False:
 			os.makedirs(save_dir)
 			print('make dir: ' + save_dir)
+
+		print(f"Saving {'burst noise' if enable_dirburst else 'standard'} data to: {save_dir}")
 		pbar = tqdm.tqdm(range(data_num), desc='generating signals')
 		for idx in pbar:
 			mic_signals, acoustic_scene = dataset[idx]  
