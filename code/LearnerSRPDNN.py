@@ -186,13 +186,14 @@ class SourceTrackingFromSTFTLearner(Learner):
 		doa_pred = pred['doa'] * 180 / np.pi 
 		vad_gt = gt['vad_sources']  
 		vad_pred = pred['vad_sources'] 
+		ss_pred = pred['spatial_spectrum']
 
 		# single source 
 		# metric = self.getmetric(doa_gt, vad_gt, doa_est, vad_est, ae_mode = ae_mode, ae_TH=ae_TH, useVAD=False, vad_TH=vad_TH, metric_unfold=Falsemetric_unfold)
 
 		# multiple source
 		metric = \
-			self.getmetric(doa_gt, vad_gt, doa_pred, vad_pred, 
+			self.getmetric(doa_gt, vad_gt, doa_pred, vad_pred, ss_pred,
 				ae_mode = metric_setting['ae_mode'], ae_TH=metric_setting['ae_TH'], 
 				useVAD=metric_setting['useVAD'], vad_TH=metric_setting['vad_TH'], 
 				metric_unfold=metric_setting['metric_unfold'])

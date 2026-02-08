@@ -301,7 +301,7 @@ class AcousticScene:
 		self.c = c 							# Speed of sound
 		self.noiseDataset = noiseDataset	# Optional noise dataset for DirBurst functionality 
  
-	def simulate(self):
+	def simulate(self, sample_idx=None):
 		""" Get the array recording using gpuRIR to perform the acoustic simulations.
 		"""
 		if self.T60 == 0:
@@ -397,7 +397,14 @@ class AcousticScene:
 		# Apply DirBurst if applicable (test time only)
 		if hasattr(self, 'noiseDataset') and self.noiseDataset is not None:
 			mic_signals = self.noiseDataset.apply_dirburst_if_enabled(
-				mic_signals.T, self.room_sz, self.mic_pos, self.T60).T
+				mic_signals.T, self.room_sz, self.mic_pos, self.T60, sample_id=sample_idx).T
+
+			# Store burst positions in the acoustic scene for plotting
+			if (hasattr(self.noiseDataset, 'dirburst_dataset') and
+				hasattr(self.noiseDataset.dirburst_dataset, 'burst_positions')):
+				self.burst_positions = self.noiseDataset.dirburst_dataset.burst_positions.copy()
+			else:
+				self.burst_positions = []
 
 		return mic_signals
 	
@@ -581,6 +588,10 @@ class NoiseDataset():
 			}
 		self.dirburst_dataset = DirBurstDataset(**dirburst_params)
 
+		# Store burst positions per sample
+		self.sample_burst_positions = {}
+		self.current_sample_id = 0
+
 	def get_random_noise(self, mic_pos=None, eps=1e-5):
 		noise_type = self.noise_type.getValue()
 
@@ -644,7 +655,7 @@ class NoiseDataset():
 
 		return noise_signal
 
-	def apply_dirburst_if_enabled(self, mic_signals, room_sz, mic_pos, T60):
+	def apply_dirburst_if_enabled(self, mic_signals, room_sz, mic_pos, T60, sample_id=None):
 		""" Apply directional noise bursts if enabled and noise_type is 'dirburst'.
 		This should be called during test time after the main simulation.
 		"""
@@ -652,8 +663,18 @@ class NoiseDataset():
 			self.dirburst_dataset.enabled and
 			self.noise_type.getValue() == 'dirburst'):
 
-			return self.dirburst_dataset.inject_directional_noise_bursts(
+			# Set sample ID for tracking
+			if sample_id is not None:
+				self.current_sample_id = sample_id
+
+			result = self.dirburst_dataset.inject_directional_noise_bursts(
 				mic_signals, self.fs, room_sz, mic_pos, T60)
+
+			# Store burst positions for this sample
+			if hasattr(self.dirburst_dataset, 'burst_positions'):
+				self.sample_burst_positions[self.current_sample_id] = self.dirburst_dataset.burst_positions.copy()
+
+			return result
 		return mic_signals
 
 	def enable_dirburst(self, enabled=True, **params):
@@ -815,6 +836,7 @@ class DirBurstDataset():
 		self.max_tries = max_tries
 		self.color = color
 		self.enabled = enabled
+		self.burst_positions = []
 
 	def inject_directional_noise_bursts(self, rev_signals, fs, room_sz, mic_pos, T60):
 		""" Add directional noise bursts to existing microphone signals.
@@ -839,6 +861,9 @@ class DirBurstDataset():
 			rev_signals = rev_signals.T
 			M, T = rev_signals.shape
 
+		# Clear and store burst noise source positions for plotting (fresh for each sample)
+		self.burst_positions = []
+
 		for _ in range(self.num_bursts):
 			# burst length
 			dur = float(np.random.uniform(self.duration_range[0], self.duration_range[1]))
@@ -859,6 +884,14 @@ class DirBurstDataset():
 			# pick a directional point & make per-mic burst via RIRs
 			array_pos = np.mean(mic_pos, axis=0)  # center of array
 			src_pos = _sample_noise_source_position(room_sz, array_pos)
+
+			# Store the burst position and array center for later use
+			self.burst_positions.append({
+				'src_pos': src_pos,
+				'array_pos': array_pos,
+				'start_time': start / fs,
+				'duration': dur
+			})
 
 			# Generate simple RIRs for directional burst
 			burst_mics = self._generate_directional_burst(src_pos, mic_pos, room_sz,
@@ -1029,7 +1062,7 @@ class RandomMicSigDataset(Dataset):
 		if idx < 0: idx = len(self) + idx
 
 		acoustic_scene = self.getRandomScene(idx)
-		mic_signals = acoustic_scene.simulate()
+		mic_signals = acoustic_scene.simulate(sample_idx=idx)
 
 		if self.save_src_noi == False:
 			acoustic_scene.source_signal = []

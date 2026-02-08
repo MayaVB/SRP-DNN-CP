@@ -1,10 +1,13 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from itertools import permutations
 from scipy.optimize import linear_sum_assignment
+import os
 
 # %% Complex number operations
 
@@ -117,18 +120,32 @@ class getMetric(nn.Module):
 		self.invlid_sidx = invalid_source_idx
 		self.eps = eps
 
-	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False):
+	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ss_pred, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False, plot_trajectories=True, plot_save_dir=None):
 		""" Args:
 				doa_gt, doa_est - (nb, nt, 2, ns) in degrees
-				vad_gt, vad_est - (nb, nt, ns) 
-				ae_mode 		- angle error mode, [*, *, *], * - 'azi', 'ele', 'aziele' 
+				vad_gt, vad_est - (nb, nt, ns)
+				ae_mode 		- angle error mode, [*, *, *], * - 'azi', 'ele', 'aziele'
 				ae_TH			- angle error threshold, namely azimuth error threshold in degrees
-				vad_TH 			- VAD threshold, [gtVAD_TH, estVAD_TH] 
+				vad_TH 			- VAD threshold, [gtVAD_TH, estVAD_TH]
 				metric_unfold	- False for dictionary, True for list
+				plot_trajectories - False to disable plotting, True to enable trajectory plots
+				plot_save_dir	- directory to save plots, defaults to 'exp/results_Simulate/metrics_plots'
 			Returns:
 				ACC, MAE or ACC, MDR, FA,R MAE, RMSE - [*, *, *]
 		"""
 		device = doa_gt.device
+		if ss_pred is not None:
+			if torch.is_tensor(ss_pred):
+				ss_pred = ss_pred.detach().float().cpu().numpy()
+			else:
+				ss_pred = np.asarray(ss_pred)
+		else:
+			ss_pred = None
+    
+		# Generate trajectory plots if requested
+		if plot_trajectories:
+			self._plot_metric_trajectories(doa_gt, vad_gt, doa_est, vad_est, ae_TH, vad_TH, useVAD, plot_save_dir)
+
 		if self.source_mode == 'single':
 
 			nbatch, nt, naziele, nsources = doa_est.shape
@@ -184,6 +201,13 @@ class getMetric(nn.Module):
 				num_sources_gt = doa_gt_one.shape[2]
 				num_sources_est = doa_est_one.shape[2]
 
+				do_heatmaps = False
+				if ss_pred is not None:
+					nt_ss = int(ss_pred.shape[1])
+					do_heatmaps = (nt_ss == nt)
+					if (b_idx == 0) and (not do_heatmaps):
+						print(f"WARN heatmaps skipped: nt_ss={nt_ss} != nt={nt}")
+
 				if useVAD == False:
 					vad_gt_one = torch.ones((nt, num_sources_gt)).to(device)
 					vad_est_one = torch.ones((nt, num_sources_est)).to(device)
@@ -202,11 +226,24 @@ class getMetric(nn.Module):
 				vad_est_one = vad_est_one * vad_gt_sum
 				K_est = vad_est_one.sum(axis=1)
     
-				# Maya
-				# if b_idx == 0:
-				# 	print("DEBUG: K_gt.sum=", K_gt.sum().item(),
-				# 		"K_est.sum=", K_est.sum().item(),
-				# 		"gt_th=", vad_TH[0], "est_th=", vad_TH[1])
+				if do_heatmaps:
+					ss_1  = ss_pred[b_idx:b_idx+1]                 # (1, nt, nele, nazi)
+					doa_gt_1  = doa_gt_one.unsqueeze(0)            # (1, nt, 2, ns_gt)
+					doa_est_1 = doa_est_one.unsqueeze(0)           # (1, nt, 2, ns_est)
+
+					vad_gt_1  = vad_gt_one.unsqueeze(0)            # (1, nt, ns_gt)
+					vad_est_1 = vad_est_one.unsqueeze(0)           # (1, nt, ns_est)
+
+					self._plot_metric_heatmaps(
+						ss_pred_np=ss_1,
+						doa_gt=doa_gt_1,
+						vad_gt=vad_gt_1,
+						doa_est=doa_est_1,
+						vad_est=vad_est_1,
+						plot_save_dir=plot_save_dir or "exp/debug_metric_plots_internal",
+						b_idx=0,                 
+						save_b_idx=b_idx,					
+						do_only_gt_active=True)
     
 				for t_idx in range(nt):
 					num_gt = int(K_gt[t_idx].item())
@@ -231,26 +268,21 @@ class getMetric(nn.Module):
 						dist_mat_az_bak[invalid_assigns] = self.inf
 						assignment = list(linear_sum_assignment(dist_mat_az_bak))
 						assignment = self.judge_assignment(dist_mat_az_bak, assignment)
+
 						for src_idx in range(num_gt):
 							if assignment[src_idx] != self.invlid_sidx:
 								corr_flag[t_idx, src_idx] = 1
 								azi_error[t_idx, src_idx] = dist_mat_az[src_idx, assignment[src_idx]]
 								ele_error[t_idx, src_idx] = dist_mat_el[src_idx, assignment[src_idx]]
 								aziele_error[t_idx, src_idx] = dist_mat_azel[src_idx, assignment[src_idx]]
-
+    
 				K_corr = corr_flag.sum(axis=1)
-				# acc[b_idx, :] = K_corr.sum(axis=0) / K_gt.sum(axis=0)
-				# mdr[b_idx, :] = (K_gt.sum(axis=0) - K_corr.sum(axis=0)) / K_gt.sum(axis=0)
-				# far[b_idx, :] = (K_est.sum(axis=0) - K_corr.sum(axis=0)) / K_gt.sum(axis=0)
-				# maya
+
 				den = K_gt.sum(axis=0) + self.eps
 				acc[b_idx, :] = K_corr.sum(axis=0) / den
 				mdr[b_idx, :] = (K_gt.sum(axis=0) - K_corr.sum(axis=0)) / den
 				far[b_idx, :] = (K_est.sum(axis=0) - K_corr.sum(axis=0)) / den
     
-    
-    
-
 				mae_temp = []
 				rmse_temp = []
 				if 'ele' in ae_mode:
@@ -319,7 +351,244 @@ class getMetric(nn.Module):
 				metric_unfold += [metric[m].item()]
 		key_list = [i for i in metric.keys()]
 		return metric_unfold, key_list
- 
+
+
+	def _plot_metric_trajectories(
+		self,
+		doa_gt,
+		vad_gt,
+		doa_est,
+		vad_est,
+		ae_TH,
+		vad_TH,
+		useVAD,
+		plot_save_dir=None
+	):
+
+		device = doa_gt.device
+
+		if plot_save_dir is None:
+			plot_save_dir = "exp/trajectory_metric_plots"
+
+		os.makedirs(plot_save_dir, exist_ok=True)
+
+		doa_gt_np = doa_gt.detach().cpu().numpy()
+		doa_est_np = doa_est.detach().cpu().numpy()
+
+		nbatch, nt, _, ns_gt = doa_gt_np.shape
+		ns_est = doa_est_np.shape[3]
+
+		for b_idx in range(nbatch):
+
+			doa_gt_one = doa_gt[b_idx]
+			doa_est_one = doa_est[b_idx]
+
+			if useVAD:
+				vad_gt_one = (vad_gt[b_idx] > vad_TH[0])
+				vad_est_one = (vad_est[b_idx] > vad_TH[1])
+			else:
+				vad_gt_one = torch.ones((nt, ns_gt)).to(device)
+				vad_est_one = torch.ones((nt, ns_est)).to(device)
+
+			# GT gating (same as metric)
+			vad_gt_sum = (vad_gt_one.sum(axis=1) > 0).reshape(nt,1).repeat(1,ns_est)
+			vad_est_one = vad_est_one * vad_gt_sum
+
+			matched_azi = np.full((nt, ns_gt), np.nan)
+			matched_ele = np.full((nt, ns_gt), np.nan)
+
+			for t_idx in range(nt):
+
+				num_gt = int(vad_gt_one[t_idx].sum())
+				num_est = int(vad_est_one[t_idx].sum())
+
+				if num_gt>0 and num_est>0:
+
+					est = doa_est_one[t_idx,:,vad_est_one[t_idx]>0]
+					gt  = doa_gt_one[t_idx,:,vad_gt_one[t_idx]>0]
+
+					dist_mat_az = torch.zeros((num_gt,num_est)).to(device)
+
+					for g in range(num_gt):
+						for e in range(num_est):
+							dist_mat_az[g,e] = self.angular_error(
+								est[1,e], gt[1,g], 'azi')
+
+					invalid_assigns = dist_mat_az > ae_TH
+
+					dist_mat_az_bak = dist_mat_az.clone()
+					dist_mat_az_bak[invalid_assigns] = self.inf
+
+					assignment = list(linear_sum_assignment(
+						dist_mat_az_bak.cpu()))
+
+					assignment = self.judge_assignment(
+						dist_mat_az_bak, assignment)
+
+					gt_indices = torch.where(vad_gt_one[t_idx])[0]
+					est_indices = torch.where(vad_est_one[t_idx])[0]
+
+					for local_gt_idx in range(num_gt):
+
+						est_idx = assignment[local_gt_idx]
+
+						if est_idx != self.invlid_sidx:
+
+							g_global = gt_indices[local_gt_idx]
+							e_global = est_indices[est_idx]
+
+							matched_azi[t_idx, g_global] = \
+								doa_est_np[b_idx,t_idx,1,e_global]
+
+							matched_ele[t_idx, g_global] = \
+								doa_est_np[b_idx,t_idx,0,e_global]
+
+			time_axis = np.arange(nt)
+
+			# plots start here
+			# azimuth
+			plt.figure(figsize=(12,6))
+			for sp in range(ns_gt):
+				plt.plot(time_axis,
+						doa_gt_np[b_idx,:,1,sp],
+						'--', label=f'GT {sp}')
+
+				plt.scatter(time_axis,
+							matched_azi[:,sp],
+							s=20, label=f'Est matched {sp}')
+
+			plt.title(f"Metric-matched Azimuth batch {b_idx}")
+			plt.xlabel("Time")
+			plt.ylabel("Azimuth")
+			plt.legend()
+			plt.grid(True)
+			plt.savefig(f"{plot_save_dir}/matched_az_batch{b_idx}.png")
+			plt.close()
+
+			# elevation
+			plt.figure(figsize=(12,6))
+			for sp in range(ns_gt):
+				plt.plot(time_axis,
+						doa_gt_np[b_idx,:,0,sp],
+						'--', label=f'GT {sp}')
+
+				plt.scatter(time_axis,
+							matched_ele[:,sp],
+							s=20, label=f'Est matched {sp}')
+
+			plt.title(f"Metric-matched Elevation batch {b_idx}")
+			plt.xlabel("Time")
+			plt.ylabel("Elevation")
+			plt.legend()
+			plt.grid(True)
+			plt.savefig(f"{plot_save_dir}/matched_el_batch{b_idx}.png")
+			plt.close()
+
+
+	def _plot_metric_heatmaps(
+		self,
+		ss_pred_np,          # numpy: (nb, nt, nele, nazi)
+		doa_gt,              # torch: (nb, nt, 2, ns) degs
+		vad_gt,              # torch/bool: (nb, nt, ns)
+		doa_est,             # torch: (nb, nt, 2, ns_est) degs
+		vad_est,             # torch/bool: (nb, nt, ns_est)  (already GT-gated if you want)
+		plot_save_dir,
+		b_idx,
+  		save_b_idx,
+		do_only_gt_active=True):
+
+		if ss_pred_np is None:
+			return
+
+		if ss_pred_np.ndim != 4:
+			if b_idx == 0:
+				print(f"WARN heatmaps skipped: ss_pred.ndim={ss_pred_np.ndim} (expected 4)")
+			return
+
+		nb, nt_ss, nele, nazi = ss_pred_np.shape
+
+		# grids: ele in [0..pi], azi in [-pi..pi]
+		# ele_deg = np.linspace(0.0, 180.0, nele)
+		# azi_deg = np.linspace(-180.0, 180.0, nazi, endpoint=False)
+		extent = [-180.0, 180.0, 0.0, 180.0]
+
+		# data for this batch
+		doa_gt_b  = doa_gt[b_idx]   # (nt, 2, ns_gt)
+		doa_est_b = doa_est[b_idx]  # (nt, 2, ns_est)
+
+		# ensure boolean masks
+		vad_gt_b  = vad_gt[b_idx].bool()
+		vad_est_b = vad_est[b_idx].bool()
+
+		# make directory per batch
+		out_dir = os.path.join(plot_save_dir, "heatmaps", f"b{save_b_idx:03d}")
+		os.makedirs(out_dir, exist_ok=True)
+
+		for t_idx in range(nt_ss):
+
+			if do_only_gt_active and (vad_gt_b[t_idx].sum().item() == 0):
+				continue
+
+			hm = ss_pred_np[b_idx, t_idx, :, :]  # (nele, nazi)
+
+			plt.figure(figsize=(8, 6))
+			plt.imshow(
+				hm,
+				origin="lower",
+				aspect="auto",
+				extent=extent,
+				interpolation="nearest"
+			)
+			plt.colorbar(label="SS score")
+
+			# overlay GT
+			gt_active = torch.where(vad_gt_b[t_idx])[0]
+			for k, s in enumerate(gt_active.tolist()):
+				ele = float(doa_gt_b[t_idx, 0, s].detach().cpu().item()) 
+				azi = float(doa_gt_b[t_idx, 1, s].detach().cpu().item()) 
+
+				# keep consistent wrap for azimuth 
+				azi = ((azi + 180.0) % 360.0) - 180.0 
+				ele = float(np.clip(ele, 0.0, 180.0))
+
+				plt.scatter(
+					azi, ele,
+					marker="x",
+					s=90,
+					linewidths=2.5,
+					c="red",
+					label="GT" if k == 0 else None
+				)
+
+			# overlay EST
+			est_active = torch.where(vad_est_b[t_idx])[0]
+			for k, s in enumerate(est_active.tolist()):
+				ele = float(doa_est_b[t_idx, 0, s].detach().cpu().item()) 
+				azi = float(doa_est_b[t_idx, 1, s].detach().cpu().item()) 
+
+				azi = ((azi + 180.0) % 360.0) - 180.0 
+				ele = float(np.clip(ele, 0.0, 180.0))
+
+				plt.scatter(
+					azi, ele,
+					marker="o",
+					s=80,
+					facecolors="none",
+					edgecolors="cyan",
+					linewidths=2.0,
+					label="EST" if k == 0 else None
+				)
+
+			plt.title(f"SS heatmap + GT/EST | b={save_b_idx} t={t_idx}")
+			plt.xlabel("Azimuth [deg]")
+			plt.ylabel("Elevation [deg]")
+			plt.legend(loc="upper right")
+			plt.tight_layout()
+
+			fname = os.path.join(out_dir, f"ss_b{save_b_idx:03d}_t{t_idx:05d}.png")
+			plt.savefig(fname, dpi=150)
+			plt.close()
+
 
 class visDOA(nn.Module):
 	""" Function: Visualize localization results
@@ -341,6 +610,11 @@ class visDOA(nn.Module):
 		num_sources_gt = doa_gt.shape[-1]
 		num_sources_pred = doa_est.shape[-1]
 		ndoa_mode = len(doa_mode)
+
+		# Define colors for different speakers/sources - red for spk1, blue for spk2
+		speaker_colors_gt = ['red', 'blue', 'green', 'magenta', 'orange', 'cyan']
+		speaker_colors_est = ['red', 'blue', 'green', 'magenta', 'orange', 'cyan']
+
 		for doa_mode_idx in range(ndoa_mode):
 			valid_flag_all = np.sum(vad_gt, axis=-1)>0
 			valid_flag_all = valid_flag_all[:,np.newaxis,np.newaxis].repeat(doa_gt.shape[1], axis=1).repeat(doa_gt.shape[2], axis=2)
@@ -350,27 +624,60 @@ class visDOA(nn.Module):
 			doa_gt_v = np.where(valid_flag_gt, doa_gt, doa_invalid)
 			doa_gt_silence_v = np.where(valid_flag_gt==0, doa_gt, doa_invalid)
 
-			valid_flag_pred = vad_est>vad_TH[1]
+			valid_flag_pred = vad_est>=vad_TH[1]
 			valid_flag_pred = valid_flag_pred[:,np.newaxis,:].repeat(doa_est.shape[1], axis=1)
-			doa_pred_v = np.where(valid_flag_pred & valid_flag_all, doa_est, doa_invalid)
-			
+   
+   			# doa_pred_v = np.where(valid_flag_pred & valid_flag_all, doa_est, doa_invalid)
+			doa_pred_v = np.where(valid_flag_pred, doa_est, doa_invalid)#  MAYA FIX: EST visibility should not depend on GT VAD!
+
 			plt.subplot(ndoa_mode, 1, doa_mode_idx+1)
 			plt.grid(linestyle=":", color="silver")
-			for source_idx in range(num_sources_gt):
-				# plt.plot(time_stamp, doa_gt[:, doa_mode_idx, source_idx], label='GT',
-				# 		color='lightgray', linewidth=3, linestyle=style[0])
-				plt_gt_silence = plt.scatter(time_stamp, doa_gt_silence_v[:, doa_mode_idx, source_idx],
+
+			# Plot GT silence for all sources (keep original style)
+			if num_sources_gt > 0:
+				plt_gt_silence = plt.scatter(time_stamp, doa_gt_silence_v[:, doa_mode_idx, 0],
 						label='GT_silence', c='whitesmoke', marker='.', linewidth=1, zorder=10)
 
+			# Plot GT active for each source with different colors and labels
+			gt_handles = []
+			for source_idx in range(num_sources_gt):
+				color = speaker_colors_gt[source_idx % len(speaker_colors_gt)]
+				speaker_label = f'GT_Spk{source_idx+1}' if num_sources_gt > 1 else 'GT'
 				plt_gt = plt.scatter(time_stamp, doa_gt_v[:, doa_mode_idx, source_idx],
-						label='GT', c='lightgray', marker='o', linewidth=1.5, zorder=11)
+						label=speaker_label, c=color, marker='x', s=50, linewidth=2.0, zorder=11)
+				gt_handles.append(plt_gt)
 
+			# Plot EST for each source with different colors, labels, and more visible markers
+			est_handles = []
 			for source_idx in range(num_sources_pred):
-				plt_est = plt.scatter(time_stamp, doa_pred_v[:, doa_mode_idx, source_idx],
-						label='EST', c='firebrick', marker='.', linewidth=0.8, zorder=12)
+				color = speaker_colors_est[source_idx % len(speaker_colors_est)]
+				speaker_label = f'EST_Spk{source_idx+1}' if num_sources_pred > 1 else 'EST'
+
+				est_data = doa_pred_v[:, doa_mode_idx, source_idx]
+				valid_est_data = est_data[est_data != doa_invalid]
+
+				# Option 1: Plot all data (including invalid markers)
+				# plt_est = plt.scatter(time_stamp, est_data,
+				# 		label=speaker_label, c=color, marker='o', s=50, linewidth=2.0, zorder=15, alpha=1.0)
+
+				# Option 2: Plot only valid points (MAYA FIX)
+				valid_mask = est_data != doa_invalid
+				if np.any(valid_mask):
+					plt_est = plt.scatter(time_stamp[valid_mask], est_data[valid_mask],
+							label=speaker_label, c=color, marker='o', s=50, linewidth=2.0, zorder=15, alpha=1.0)
+				else:
+					# Create empty plot to maintain legend consistency
+					plt_est = plt.scatter([], [], label=speaker_label, c=color, marker='o', s=50, alpha=0.0)
+				est_handles.append(plt_est)
 
 			plt.gca().set_prop_cycle(None)
-			plt.legend(handles = [plt_gt_silence, plt_gt, plt_est])
+			# Create legend with all handles
+			all_handles = []
+			if num_sources_gt > 0:
+				all_handles.append(plt_gt_silence)
+			all_handles.extend(gt_handles)
+			all_handles.extend(est_handles)
+			plt.legend(handles=all_handles)
 			plt.xlabel('Time [s]')
 			plt.ylabel(doa_mode[doa_mode_idx])
 			plt.ylim(range_mode[doa_mode_idx][0],range_mode[doa_mode_idx][1])
