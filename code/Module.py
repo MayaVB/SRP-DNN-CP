@@ -9,6 +9,7 @@ from itertools import permutations
 from scipy.optimize import linear_sum_assignment
 import os
 
+
 # %% Complex number operations
 
 def complex_multiplication(x, y):
@@ -120,7 +121,7 @@ class getMetric(nn.Module):
 		self.invlid_sidx = invalid_source_idx
 		self.eps = eps
 
-	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ss_pred, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False, plot_trajectories=True, plot_save_dir=None):
+	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ss_pred, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False, plot_trajectories=True, plot_heatmap=True, plot_save_dir=None, burst_data=None):
 		""" Args:
 				doa_gt, doa_est - (nb, nt, 2, ns) in degrees
 				vad_gt, vad_est - (nb, nt, ns)
@@ -130,6 +131,7 @@ class getMetric(nn.Module):
 				metric_unfold	- False for dictionary, True for list
 				plot_trajectories - False to disable plotting, True to enable trajectory plots
 				plot_save_dir	- directory to save plots, defaults to 'exp/results_Simulate/metrics_plots'
+				burst_data		- burst_positions from .npz file (list of burst dicts), optional
 			Returns:
 				ACC, MAE or ACC, MDR, FA,R MAE, RMSE - [*, *, *]
 		"""
@@ -144,7 +146,7 @@ class getMetric(nn.Module):
     
 		# Generate trajectory plots if requested
 		if plot_trajectories:
-			self._plot_metric_trajectories(doa_gt, vad_gt, doa_est, vad_est, ae_TH, vad_TH, useVAD, plot_save_dir)
+			self._plot_metric_trajectories(doa_gt, vad_gt, doa_est, vad_est, ae_TH, vad_TH, useVAD, plot_save_dir, burst_data)
 
 		if self.source_mode == 'single':
 
@@ -201,13 +203,6 @@ class getMetric(nn.Module):
 				num_sources_gt = doa_gt_one.shape[2]
 				num_sources_est = doa_est_one.shape[2]
 
-				do_heatmaps = False
-				if ss_pred is not None:
-					nt_ss = int(ss_pred.shape[1])
-					do_heatmaps = (nt_ss == nt)
-					if (b_idx == 0) and (not do_heatmaps):
-						print(f"WARN heatmaps skipped: nt_ss={nt_ss} != nt={nt}")
-
 				if useVAD == False:
 					vad_gt_one = torch.ones((nt, num_sources_gt)).to(device)
 					vad_est_one = torch.ones((nt, num_sources_est)).to(device)
@@ -226,7 +221,13 @@ class getMetric(nn.Module):
 				vad_est_one = vad_est_one * vad_gt_sum
 				K_est = vad_est_one.sum(axis=1)
     
-				if do_heatmaps:
+				if plot_heatmap:
+					if ss_pred is not None:
+						nt_ss = int(ss_pred.shape[1])
+						plot_heatmap = (nt_ss == nt)
+						if (b_idx == 0) and (not plot_heatmap):
+							print(f"WARN heatmaps skipped: nt_ss={nt_ss} != nt={nt}")
+        
 					ss_1  = ss_pred[b_idx:b_idx+1]                 # (1, nt, nele, nazi)
 					doa_gt_1  = doa_gt_one.unsqueeze(0)            # (1, nt, 2, ns_gt)
 					doa_est_1 = doa_est_one.unsqueeze(0)           # (1, nt, 2, ns_est)
@@ -240,10 +241,11 @@ class getMetric(nn.Module):
 						vad_gt=vad_gt_1,
 						doa_est=doa_est_1,
 						vad_est=vad_est_1,
-						plot_save_dir=plot_save_dir or "exp/debug_metric_plots_internal",
-						b_idx=0,                 
-						save_b_idx=b_idx,					
-						do_only_gt_active=True)
+						plot_save_dir=None,
+						b_idx=0,
+						save_b_idx=b_idx,
+						do_only_gt_active=True,
+						burst_data=burst_data)
     
 				for t_idx in range(nt):
 					num_gt = int(K_gt[t_idx].item())
@@ -352,6 +354,79 @@ class getMetric(nn.Module):
 		key_list = [i for i in metric.keys()]
 		return metric_unfold, key_list
 
+	def _calculate_burst_doa(self, burst_positions, fs=16000, frame_shift=512):
+		""" Calculate DOA angles for burst noise sources
+		Args:
+			burst_positions: list of burst dictionaries with 'src_pos', 'array_pos', 'start_time', 'duration'
+			fs: sampling frequency (Hz)
+			frame_shift: frame shift in samples (default 512)
+		Returns:
+			burst_doa_data: list of dictionaries with 'ele', 'azi', 'start_frame', 'end_frame'
+		"""
+		burst_doa_data = []
+
+		for burst in burst_positions:
+			src_pos = burst['src_pos']
+			array_pos = burst['array_pos']
+			start_time = burst['start_time']
+			duration = burst['duration']
+
+			# Convert to numpy arrays/scalars if they are tensors
+			if torch.is_tensor(src_pos):
+				src_pos = src_pos.detach().cpu().numpy()
+			if torch.is_tensor(array_pos):
+				array_pos = array_pos.detach().cpu().numpy()
+			if torch.is_tensor(start_time):
+				start_time = start_time.detach().cpu().numpy().item()
+			if torch.is_tensor(duration):
+				duration = duration.detach().cpu().numpy().item()
+
+			# Ensure we have numpy arrays and flatten them to 1D
+			src_pos = np.asarray(src_pos).flatten()
+			array_pos = np.asarray(array_pos).flatten()
+
+			# Calculate relative position vector from array to source
+			rel_pos = src_pos - array_pos
+
+			# Convert to spherical coordinates (DOA)
+			# Distance from array to source
+			distance = np.sqrt(np.sum(rel_pos**2))
+
+			# Elevation angle (0 to 180 degrees)
+			# elevation = arccos(z / distance)
+			elevation_rad = np.arccos(np.clip(rel_pos[2] / distance, -1.0, 1.0))
+			elevation_deg = np.degrees(elevation_rad)
+
+			# Azimuth angle (-180 to 180 degrees)
+			# azimuth = atan2(y, x)
+			azimuth_rad = np.arctan2(rel_pos[1], rel_pos[0])
+			azimuth_deg = np.degrees(azimuth_rad)
+
+			# Convert time to frame indices
+			# Account for 12x downsampling in model output (from paper: input frame rate compressed by factor of 12)
+			start_frame_full = int(start_time * fs / frame_shift)
+			end_frame_full = int((start_time + duration) * fs / frame_shift)
+			start_frame = start_frame_full // 12
+			end_frame = end_frame_full // 12
+
+			# print(f"[FRAME DEBUG] start_time={start_time:.3f}s -> full_frame {start_frame_full} -> output_frame {start_frame}, duration={duration:.3f}s -> end_frame {end_frame}")
+
+			burst_doa_data.append({
+				'ele': elevation_deg,
+				'azi': azimuth_deg,
+				'start_frame': start_frame,
+				'end_frame': end_frame,
+				'start_time': start_time,
+				'duration': duration,
+				'src_pos': src_pos,
+				'array_pos': array_pos
+			})
+
+			# print(f"[BURST DEBUG] azi={azimuth_deg:.2f} ele={elevation_deg:.2f} "
+			# 		f"frames=[{start_frame},{end_frame}] "
+			# 		f"time=[{start_time:.3f}s -> {start_time+duration:.3f}s]")
+
+		return burst_doa_data
 
 	def _plot_metric_trajectories(
 		self,
@@ -362,7 +437,8 @@ class getMetric(nn.Module):
 		ae_TH,
 		vad_TH,
 		useVAD,
-		plot_save_dir=None
+		plot_save_dir=None,
+		burst_data=None
 	):
 
 		device = doa_gt.device
@@ -411,41 +487,32 @@ class getMetric(nn.Module):
 
 					for g in range(num_gt):
 						for e in range(num_est):
-							dist_mat_az[g,e] = self.angular_error(
-								est[1,e], gt[1,g], 'azi')
+							dist_mat_az[g,e] = self.angular_error(est[1,e], gt[1,g], 'azi')
 
 					invalid_assigns = dist_mat_az > ae_TH
 
 					dist_mat_az_bak = dist_mat_az.clone()
 					dist_mat_az_bak[invalid_assigns] = self.inf
 
-					assignment = list(linear_sum_assignment(
-						dist_mat_az_bak.cpu()))
-
-					assignment = self.judge_assignment(
-						dist_mat_az_bak, assignment)
+					assignment = list(linear_sum_assignment(dist_mat_az_bak.cpu()))
+					assignment = self.judge_assignment(dist_mat_az_bak, assignment)
 
 					gt_indices = torch.where(vad_gt_one[t_idx])[0]
 					est_indices = torch.where(vad_est_one[t_idx])[0]
 
 					for local_gt_idx in range(num_gt):
-
 						est_idx = assignment[local_gt_idx]
 
 						if est_idx != self.invlid_sidx:
-
 							g_global = gt_indices[local_gt_idx]
 							e_global = est_indices[est_idx]
 
-							matched_azi[t_idx, g_global] = \
-								doa_est_np[b_idx,t_idx,1,e_global]
-
-							matched_ele[t_idx, g_global] = \
-								doa_est_np[b_idx,t_idx,0,e_global]
+							matched_azi[t_idx, g_global] = doa_est_np[b_idx,t_idx,1,e_global]
+							matched_ele[t_idx, g_global] = doa_est_np[b_idx,t_idx,0,e_global]
 
 			time_axis = np.arange(nt)
 
-			# plots start here
+			# plots
 			# azimuth
 			plt.figure(figsize=(12,6))
 			for sp in range(ns_gt):
@@ -456,6 +523,33 @@ class getMetric(nn.Module):
 				plt.scatter(time_axis,
 							matched_azi[:,sp],
 							s=20, label=f'Est matched {sp}')
+
+			# Add burst noise visualization for azimuth
+			if burst_data is not None:
+				# burst_data is now a list for each batch sample
+				current_burst_data = burst_data[b_idx] if isinstance(burst_data, list) and b_idx < len(burst_data) else burst_data
+				if current_burst_data is not None:
+					burst_doa_data = self._calculate_burst_doa(current_burst_data, fs=16000, frame_shift=256)
+					for k, burst in enumerate(burst_doa_data):
+						start_f = burst['start_frame']
+						end_f   = burst['end_frame']
+
+						print(f"we are at batch {b_idx}, plotting burst with: start_time={burst['start_time']}, end_time=NaN, duration={burst['duration']} start_frame={start_f}, end_frame={end_f}, burst DOA: azi={burst['azi']:.2f}, ele={burst['ele']:.2f}")
+
+						# clamp to plot range
+						start_f = max(0, min(start_f, nt-1))
+						end_f   = max(0, min(end_f, nt))
+
+						if start_f < end_f:
+							plt.axvspan(start_f, end_f, color='orange', alpha=0.15,
+									label='Burst noise' if k == 0 else None)
+
+							plt.axvline(x=start_f, color='red', linestyle=':', alpha=0.7, linewidth=2)
+							plt.axvline(x=end_f,   color='red', linestyle=':', alpha=0.7, linewidth=2)
+
+							# Optional: draw the burst DOA as a thick horizontal segment
+							plt.plot([start_f, end_f], [burst['azi'], burst['azi']],
+									color='orange', linewidth=4, alpha=0.8)
 
 			plt.title(f"Metric-matched Azimuth batch {b_idx}")
 			plt.xlabel("Time")
@@ -476,6 +570,31 @@ class getMetric(nn.Module):
 							matched_ele[:,sp],
 							s=20, label=f'Est matched {sp}')
 
+			# Add burst noise visualization for elevation
+			if burst_data is not None:
+				# burst_data is now a list for each batch sample
+				current_burst_data = burst_data[b_idx] if isinstance(burst_data, list) and b_idx < len(burst_data) else burst_data
+				if current_burst_data is not None:
+					burst_doa_data = self._calculate_burst_doa(current_burst_data, fs=16000, frame_shift=256)
+					for k, burst in enumerate(burst_doa_data):
+						start_f = burst['start_frame']
+						end_f   = burst['end_frame']
+
+						# clamp to plot range
+						start_f = max(0, min(start_f, nt-1))
+						end_f   = max(0, min(end_f, nt))
+
+						if start_f < end_f:
+							plt.axvspan(start_f, end_f, color='orange', alpha=0.15,
+									label='Burst noise' if k == 0 else None)
+
+							plt.axvline(x=start_f, color='red', linestyle=':', alpha=0.7, linewidth=2)
+							plt.axvline(x=end_f,   color='red', linestyle=':', alpha=0.7, linewidth=2)
+
+							# Optional: draw the burst DOA as a thick horizontal segment
+							plt.plot([start_f, end_f], [burst['ele'], burst['ele']],
+									color='orange', linewidth=4, alpha=0.8)
+
 			plt.title(f"Metric-matched Elevation batch {b_idx}")
 			plt.xlabel("Time")
 			plt.ylabel("Elevation")
@@ -495,7 +614,8 @@ class getMetric(nn.Module):
 		plot_save_dir,
 		b_idx,
   		save_b_idx,
-		do_only_gt_active=True):
+		do_only_gt_active=True,
+		burst_data=None):
 
 		if ss_pred_np is None:
 			return
@@ -505,11 +625,31 @@ class getMetric(nn.Module):
 				print(f"WARN heatmaps skipped: ss_pred.ndim={ss_pred_np.ndim} (expected 4)")
 			return
 
+
+		if plot_save_dir is None:
+			plot_save_dir = "exp/heatmap_trj_metric_plots"
+
+		os.makedirs(plot_save_dir, exist_ok=True)
+
 		nb, nt_ss, nele, nazi = ss_pred_np.shape
 
+		# Calculate global min/max for consistent heatmap scaling across all time frames (log scale)
+		# Add small epsilon to avoid log(0)
+		eps = 1e-10
+		ss_log = 10*np.log10(ss_pred_np[b_idx] + eps)
+		vmin = np.min(ss_log)
+		vmax = np.max(ss_log)
+
+		if (save_b_idx == 0) and (burst_data is not None):
+			# burst_data is now a list for each batch sample
+			current_burst_data = burst_data[save_b_idx] if isinstance(burst_data, list) and save_b_idx < len(burst_data) else burst_data
+			if current_burst_data is not None:
+				bd = self._calculate_burst_doa(current_burst_data, fs=16000, frame_shift=256)  # your current
+				print(f"[HM BURST] nt_ss={nt_ss}")
+				for i,b in enumerate(bd[:5]):
+					print(f"[HM BURST] {i}: frames [{b['start_frame']}..{b['end_frame']}]")
+
 		# grids: ele in [0..pi], azi in [-pi..pi]
-		# ele_deg = np.linspace(0.0, 180.0, nele)
-		# azi_deg = np.linspace(-180.0, 180.0, nazi, endpoint=False)
 		extent = [-180.0, 180.0, 0.0, 180.0]
 
 		# data for this batch
@@ -530,16 +670,19 @@ class getMetric(nn.Module):
 				continue
 
 			hm = ss_pred_np[b_idx, t_idx, :, :]  # (nele, nazi)
+			hm_log = 10*np.log10(hm + eps)  # Apply log transform (dB scale)
 
 			plt.figure(figsize=(8, 6))
 			plt.imshow(
-				hm,
+				hm_log,
 				origin="lower",
 				aspect="auto",
 				extent=extent,
-				interpolation="nearest"
+				interpolation="nearest",
+				vmin=vmin,
+				vmax=vmax
 			)
-			plt.colorbar(label="SS score")
+			plt.colorbar(label="SS score (dB)")
 
 			# overlay GT
 			gt_active = torch.where(vad_gt_b[t_idx])[0]
@@ -578,6 +721,29 @@ class getMetric(nn.Module):
 					linewidths=2.0,
 					label="EST" if k == 0 else None
 				)
+
+			# overlay BURST NOISE
+			if burst_data is not None:
+				# burst_data is now a list for each batch sample, use save_b_idx (the real batch index)
+				current_burst_data = burst_data[save_b_idx] if isinstance(burst_data, list) and save_b_idx < len(burst_data) else burst_data
+				if current_burst_data is not None:
+					burst_doa_data = self._calculate_burst_doa(current_burst_data, fs=16000, frame_shift=256)
+					for k, burst in enumerate(burst_doa_data):
+						# Check if burst is active at current time frame
+						if burst['start_frame'] <= t_idx < burst['end_frame']:
+							ele = float(np.clip(burst['ele'], 0.0, 180.0))
+							azi = ((burst['azi'] + 180.0) % 360.0) - 180.0
+
+							plt.scatter(
+								azi, ele,
+								marker="^",
+								s=100,
+								facecolors="yellow",
+								edgecolors="orange",
+								linewidths=2.5,
+								label="BURST" if k == 0 else None,
+								zorder=20
+							)
 
 			plt.title(f"SS heatmap + GT/EST | b={save_b_idx} t={t_idx}")
 			plt.xlabel("Azimuth [deg]")

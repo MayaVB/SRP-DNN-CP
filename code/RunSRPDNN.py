@@ -365,7 +365,14 @@ if __name__ == "__main__":
 								return x
 							if isinstance(x[0], dict):
 								# dict of tensors per batch -> dict of concatenated tensors
-								return {k: torch.cat([xb[k] for xb in x], dim=0) for k in x[0].keys()}
+								result = {}
+								for k in x[0].keys():
+									if torch.is_tensor(x[0][k]):
+										result[k] = torch.cat([xb[k] for xb in x], dim=0)
+									else:
+										# For non-tensor values like burst_data, collect all samples
+										result[k] = [xb[k] for xb in x]
+								return result
 							else:
 								# list of tensors -> concatenated tensor
 								return torch.cat(x, dim=0)

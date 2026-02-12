@@ -1,10 +1,35 @@
 import torch
 import numpy as np
 import torch
-import random 
+import random
 import pickle
-import soundfile 
+import soundfile
 from copy import deepcopy
+
+def load_burst_data_from_npz(npz_file_path):
+	""" Load burst noise data from .npz file
+	Args:
+		npz_file_path: path to the .npz file containing burst_positions
+	Returns:
+		burst_positions: list of burst dictionaries, or None if file not found/error
+	"""
+	try:
+		data = np.load(npz_file_path, allow_pickle=True)
+		if 'burst_positions' in data:
+			burst_positions = data['burst_positions']
+			# Handle both cases: already a list or needs conversion
+			if isinstance(burst_positions, list):
+				print(f"Loaded burst_positions list, total bursts: {len(burst_positions)}")
+				print(f"data is: {burst_positions}")
+				return burst_positions
+			else:
+				return burst_positions.tolist()
+		else:
+			print(f"Warning: 'burst_positions' not found in {npz_file_path}")
+			return None
+	except Exception as e:
+		print(f"Warning: Could not load burst data from {npz_file_path}: {e}")
+		return None
 
 ## for training process 
 
@@ -72,6 +97,8 @@ def save_file(mic_signal, acoustic_scene, sig_path, acous_path):
 
 def load_file(acoustic_scene, sig_path, acous_path):
 
+    burst_data = None
+
     if sig_path is not None:
         mic_signal, fs = soundfile.read(sig_path)
 
@@ -81,12 +108,17 @@ def load_file(acoustic_scene, sig_path, acous_path):
         file.close()
         acoustic_scene.__dict__ = pickle.loads(dataPickle)
 
+        # Load burst data from the same npz file
+        burst_data = load_burst_data_from_npz(acous_path)
+
     if (sig_path is not None) & (acous_path is not None):
-        return mic_signal, acoustic_scene
+        return mic_signal, acoustic_scene, burst_data
     elif (sig_path is not None) & (acous_path is None):
-        return mic_signal
+        return mic_signal, None, None
     elif (sig_path is None) & (acous_path is not None):
-        return acoustic_scene
+        return None, acoustic_scene, burst_data
+    else:
+        return None, None, None
 
 def forgetting_norm(input, num_frame_set=None):
     """
@@ -134,23 +166,28 @@ def save_file(mic_signal, acoustic_scene, sig_path, acous_path):
 	# scipy.io.savemat(data_path, {'mic_signals': mic_signals, 'acoustic_scene': acoustic_scene})
 
 
-def load_file(acoustic_scene, sig_path, acous_path):
+# def load_file(acoustic_scene, sig_path, acous_path):
 
-    if sig_path is not None:
-        mic_signal, fs = soundfile.read(sig_path)
+#     burst_data = None
 
-    if acous_path is not None:
-        file = open(acous_path,'rb')
-        dataPickle = file.read()
-        file.close()
-        acoustic_scene.__dict__ = pickle.loads(dataPickle)
+#     if sig_path is not None:
+#         mic_signal, fs = soundfile.read(sig_path)
 
-    if (sig_path is not None) & (acous_path is not None):
-        return mic_signal, acoustic_scene
-    elif (sig_path is not None) & (acous_path is None):
-        return mic_signal
-    elif (sig_path is None) & (acous_path is not None):
-        return acoustic_scene
+#     if acous_path is not None:
+#         file = open(acous_path,'rb')
+#         dataPickle = file.read()
+#         file.close()
+#         acoustic_scene.__dict__ = pickle.loads(dataPickle)
+
+#         # Load burst data from the same npz file
+#         burst_data = load_burst_data_from_npz(acous_path)
+
+#     if (sig_path is not None) & (acous_path is not None):
+#         return mic_signal, acoustic_scene, burst_data
+#     elif (sig_path is not None) & (acous_path is None):
+#         return mic_signal, None
+#     elif (sig_path is None) & (acous_path is not None):
+#         return acoustic_scene, burst_data
 
     ## When reading mat file, the array_setup cannot present normally
     # data = scipy.io.loadmat(load_dir+'/'+name+'.mat')

@@ -136,7 +136,7 @@ if (args.data_op == 'save_sig') | (args.data_op == 'save_RIR'):
 	# Data generation
 	if args.data_op == 'save_sig':
 		if enable_dirburst:
-			save_dir = dirs['sensig_'+args.stage] + '_burstV2'
+			save_dir = dirs['sensig_'+args.stage] + '_burstV3'
 		else:
 			save_dir = dirs['sensig_'+args.stage]
 		exist_temp = os.path.exists(save_dir)
@@ -181,7 +181,7 @@ elif (args.data_op == 'read_sig') | ( args.data_op == 'read_RIR'):
 	if (args.data_op == 'read_sig'):
 		sig_path = dirs['sensig_val'] + '/' + '0.wav'
 		acous_path = dirs['sensig_val'] + '/' + '0.npz'
-		mic_signal, acoustic_scene = load_file(acoustic_scene, sig_path, acous_path)
+		mic_signal, acoustic_scene, burst_data = load_file(acoustic_scene, sig_path, acous_path)
 	# if ( args.data_op == 'read_RIR'):
 	# 	acous_path = dirs['rir_train'] + '/' + '0.npz'
 	# 	acoustic_scene = load_file(acoustic_scene, sig_path=None, acous_path=acous_path)

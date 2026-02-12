@@ -166,9 +166,10 @@ class SourceTrackingFromSTFTLearner(Learner):
 			pred_batch['vad_sources'] = pred_VADs
 			pred_batch['spatial_spectrum'] = pred_ss
 
-		if gt_batch is not None: 
+		if gt_batch is not None:
 			for key in gt_batch.keys():
-				gt_batch[key] = gt_batch[key].detach()
+				if torch.is_tensor(gt_batch[key]):
+					gt_batch[key] = gt_batch[key].detach()
 
 		return pred_batch, gt_batch 
 
@@ -182,20 +183,21 @@ class SourceTrackingFromSTFTLearner(Learner):
 			Returns:
 				metric	- dict or list
         """
-		doa_gt = gt['doa'] * 180 / np.pi 
-		doa_pred = pred['doa'] * 180 / np.pi 
-		vad_gt = gt['vad_sources']  
-		vad_pred = pred['vad_sources'] 
+		doa_gt = gt['doa'] * 180 / np.pi
+		doa_pred = pred['doa'] * 180 / np.pi
+		vad_gt = gt['vad_sources']
+		vad_pred = pred['vad_sources']
 		ss_pred = pred['spatial_spectrum']
+		burst_data = gt.get('burst_data', None)  # Extract burst_data from gt dict
 
-		# single source 
+		# single source
 		# metric = self.getmetric(doa_gt, vad_gt, doa_est, vad_est, ae_mode = ae_mode, ae_TH=ae_TH, useVAD=False, vad_TH=vad_TH, metric_unfold=Falsemetric_unfold)
 
 		# multiple source
 		metric = \
 			self.getmetric(doa_gt, vad_gt, doa_pred, vad_pred, ss_pred,
-				ae_mode = metric_setting['ae_mode'], ae_TH=metric_setting['ae_TH'], 
-				useVAD=metric_setting['useVAD'], vad_TH=metric_setting['vad_TH'], 
-				metric_unfold=metric_setting['metric_unfold'])
+				ae_mode = metric_setting['ae_mode'], ae_TH=metric_setting['ae_TH'],
+				useVAD=metric_setting['useVAD'], vad_TH=metric_setting['vad_TH'],
+				metric_unfold=metric_setting['metric_unfold'], burst_data=burst_data)
 
 		return metric

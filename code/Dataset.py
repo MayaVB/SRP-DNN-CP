@@ -991,18 +991,19 @@ class FixMicSigDataset(Dataset):
 					DOA = [],
 					c = []
 				)
-		mic_signals, acoustic_scene = load_file(acoustic_scene, sig_path, acous_path)
+		mic_signals, acoustic_scene, burst_data = load_file(acoustic_scene, sig_path, acous_path)
 
 		if self.transforms is not None:
 			for t in self.transforms:
 				mic_signals, acoustic_scene = t(mic_signals, acoustic_scene)
 
 		if self.return_acoustic_scene:
-			return mic_signals, acoustic_scene
-		else: 
+			return mic_signals, acoustic_scene, burst_data
+		else:
 			gts = {}
 			gts['doa'] = acoustic_scene.DOAw.astype(np.float32)
 			gts['vad_sources'] = acoustic_scene.mic_vad_sources.astype(np.float32)
+			gts['burst_data'] = burst_data
 			# gts['vad'] = acoustic_scene.mic_vad
 
 			return mic_signals, gts
