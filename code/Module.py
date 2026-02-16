@@ -121,7 +121,7 @@ class getMetric(nn.Module):
 		self.invlid_sidx = invalid_source_idx
 		self.eps = eps
 
-	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ss_pred, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False, plot_trajectories=True, plot_heatmap=True, plot_save_dir=None, burst_data=None):
+	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ss_pred, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False, plot_trajectories=True, plot_heatmap=True, plot_save_dir=None, burst_data=None, cp_regions=None):
 		""" Args:
 				doa_gt, doa_est - (nb, nt, 2, ns) in degrees
 				vad_gt, vad_est - (nb, nt, ns)
@@ -244,8 +244,9 @@ class getMetric(nn.Module):
 						plot_save_dir=None,
 						b_idx=0,
 						save_b_idx=b_idx,
-						do_only_gt_active=True,
-						burst_data=burst_data)
+						do_only_gt_active=False,
+						burst_data=burst_data,
+						cp_regions=cp_regions)
     
 				for t_idx in range(nt):
 					num_gt = int(K_gt[t_idx].item())
@@ -615,7 +616,8 @@ class getMetric(nn.Module):
 		b_idx,
   		save_b_idx,
 		do_only_gt_active=True,
-		burst_data=None):
+		burst_data=None,
+		cp_regions=None):    # NEW: CP regions data
 
 		if ss_pred_np is None:
 			return
@@ -745,7 +747,66 @@ class getMetric(nn.Module):
 								zorder=20
 							)
 
-			plt.title(f"SS heatmap + GT/EST | b={save_b_idx} t={t_idx}")
+			# overlay CP REGIONS
+			print(f"DEBUG CP: cp_regions is None? {cp_regions is None}")
+			if cp_regions is not None:
+				print(f"DEBUG CP: len(cp_regions)={len(cp_regions)}, save_b_idx={save_b_idx}, t_idx={t_idx}")
+				if save_b_idx < len(cp_regions):
+					print(f"DEBUG CP: len(cp_regions[{save_b_idx}])={len(cp_regions[save_b_idx])}")
+					if t_idx < len(cp_regions[save_b_idx]):
+						regions_for_frame = cp_regions[save_b_idx][t_idx]
+						print(f"DEBUG CP: regions_for_frame is None? {regions_for_frame is None}")
+						if regions_for_frame is not None:
+							print(f"DEBUG CP: Found {len(regions_for_frame)} CP regions to plot!")
+						else:
+							print("DEBUG CP: regions_for_frame is None")
+					else:
+						print(f"DEBUG CP: t_idx {t_idx} >= len(cp_regions[{save_b_idx}]) {len(cp_regions[save_b_idx])}")
+				else:
+					print(f"DEBUG CP: save_b_idx {save_b_idx} >= len(cp_regions) {len(cp_regions)}")
+
+			if cp_regions is not None and save_b_idx < len(cp_regions) and t_idx < len(cp_regions[save_b_idx]):
+				regions_for_frame = cp_regions[save_b_idx][t_idx]
+				if regions_for_frame is not None:
+					# Get grid dimensions
+					nele, nazi = ss_pred_np.shape[2], ss_pred_np.shape[3]
+					ele_grid = np.linspace(0.0, 180.0, nele)
+					azi_grid = np.linspace(-180.0, 180.0, nazi, endpoint=False)
+
+					# Color palette for different regions
+					cp_colors = ['lime', 'magenta', 'white', 'lightblue', 'pink']
+
+					for r_idx, region in enumerate(regions_for_frame):
+						bounds = region['region_bounds']
+						color = cp_colors[r_idx % len(cp_colors)]
+
+						# Convert grid indices to degrees
+						ele_min = ele_grid[bounds['ele_min']]
+						ele_max = ele_grid[bounds['ele_max']]
+						azi_min = azi_grid[bounds['azi_min']]
+						azi_max = azi_grid[bounds['azi_max']]
+
+						# Draw rectangle around CP region
+						rect_azi = [azi_min, azi_max, azi_max, azi_min, azi_min]
+						rect_ele = [ele_min, ele_min, ele_max, ele_max, ele_min]
+
+						plt.plot(rect_azi, rect_ele,
+								color=color, linewidth=3, alpha=0.9,
+								label=f"CP-R{r_idx+1}" if r_idx < 3 else None,
+								zorder=25)
+
+						# Mark region centroid if available
+						if 'weighted_centroid' in region:
+							centroid_ele_idx, centroid_azi_idx = region['weighted_centroid']
+							centroid_ele = ele_grid[int(np.clip(centroid_ele_idx, 0, nele-1))]
+							centroid_azi = azi_grid[int(np.clip(centroid_azi_idx, 0, nazi-1))]
+
+							plt.plot(centroid_azi, centroid_ele, 'o',
+									color=color, markersize=6, alpha=0.8,
+									markerfacecolor=color, markeredgecolor='black',
+									markeredgewidth=1, zorder=26)
+
+			plt.title(f"SS heatmap + GT/EST + CP | b={save_b_idx} t={t_idx}")
 			plt.xlabel("Azimuth [deg]")
 			plt.ylabel("Elevation [deg]")
 			plt.legend(loc="upper right")

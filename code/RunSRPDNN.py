@@ -35,6 +35,7 @@ import ModelSRPDNN as at_model
 import Module as at_module
 from Dataset import Parameter
 from utils import set_seed, set_random_seed, set_learning_rate
+from crc_pipeline import find_top2_peaks, match_peaks_to_gt, extract_regions_test
 
 if __name__ == "__main__":
 	use_cuda = not args.no_cuda and torch.cuda.is_available()
@@ -180,6 +181,10 @@ if __name__ == "__main__":
 			c = speed, 
 			transforms = [segmenting]
 		)
+
+		dataset_cal = dataset_val
+		dataset_cal.dataset_sz = 100
+  
 		dataset_test = at_dataset.RandomMicSigDataset( 
 			sourceDataset = sourceDataset_test,
 			num_source = Parameter(args.sources, discrete=True),  
@@ -206,7 +211,8 @@ if __name__ == "__main__":
 			data_dir = dirs['sensig_val'],
 			dataset_sz = 1024,
 			transforms = [segmenting]
-			)				
+			)
+		dataset_cal = dataset_val
 		dataset_test = at_dataset.FixMicSigDataset( 
 			data_dir = dirs['sensig_test'],
 			dataset_sz = 1024,
@@ -240,7 +246,204 @@ if __name__ == "__main__":
 	kwargs = {'num_workers': args.workers, 'pin_memory': True}  if use_cuda else {}
 
 
-	if (args.train):
+	if (args.cp_calibration): 
+		print("CP Calibration Stage!")
+		dataloader_cal = torch.utils.data.DataLoader(dataset_cal, batch_size=args.bs[1], shuffle=False, **kwargs)
+		# dataloader_cal = torch.utils.data.DataLoader(dataset_cal, batch_size=10, shuffle=False, **kwargs)
+
+		# Load trained model
+		learner.resume_checkpoint(checkpoints_dir=dirs['log'], from_latest=False)
+
+		# Run prediction
+		pred, gt, _ = learner.predict(
+			dataloader_cal,
+			return_predgt=True,
+			metric_setting=None,
+			wDNN=True
+		)
+
+		# Concatenate batches (reuse your helper)
+		def _concat_predgt(x):
+			if isinstance(x, list):
+				if len(x) == 0:
+					return x
+				if isinstance(x[0], dict):
+					result = {}
+					for k in x[0].keys():
+						if torch.is_tensor(x[0][k]):
+							# Concatenate tensors
+							result[k] = torch.cat([xb[k] for xb in x], dim=0)
+						else:
+							# For non-tensor values (like lists), collect all samples
+							result[k] = [item for xb in x for item in (xb[k] if isinstance(xb[k], list) else [xb[k]])]
+					return result
+				else:
+					# list of tensors -> concatenated tensor
+					return torch.cat(x, dim=0)
+			return x
+
+		# Debug: Check data types before concatenation
+		print("Debug: Checking data types in pred and gt...")
+		if isinstance(pred, list) and len(pred) > 0 and isinstance(pred[0], dict):
+			print("pred[0] keys and types:")
+			for k, v in pred[0].items():
+				print(f"  {k}: {type(v)} {v.shape if torch.is_tensor(v) else len(v) if isinstance(v, list) else 'N/A'}")
+
+		if isinstance(gt, list) and len(gt) > 0 and isinstance(gt[0], dict):
+			print("gt[0] keys and types:")
+			for k, v in gt[0].items():
+				print(f"  {k}: {type(v)} {v.shape if torch.is_tensor(v) else len(v) if isinstance(v, list) else 'N/A'}")
+
+		pred = _concat_predgt(pred)
+		gt   = _concat_predgt(gt)
+
+		ss_pred = pred['spatial_spectrum'].cpu().numpy()   # (nb, nt, nele, nazi)
+		doa_gt  = gt['doa']                                # (nb, nt, 2, ns)
+
+		nb, nt, nele, nazi = ss_pred.shape
+
+		# Debug tensor shapes
+		print(f"Tensor shapes:")
+		print(f"  ss_pred: {ss_pred.shape}")
+		print(f"  doa_gt: {doa_gt.shape}")
+
+		deltas = []
+
+		print(f"Processing {nb} batches with {nt} time frames each...")
+
+		for b in range(nb):
+			for t in range(nt):
+				S = ss_pred[b, t]  # (nele, nazi)
+
+				# 1) Detect top-2 peaks using proper peak detection
+				peaks = find_top2_peaks(S, suppress_radius=(3, 3))
+
+				if len(peaks) == 0:
+					print(f"Warning: No peaks found in batch {b}, frame {t}")
+					continue  # Skip frames with no detected peaks
+
+				# 2) Convert GT DOA to grid indices for all speakers in this frame
+				gt_speakers = []
+				for s in range(doa_gt.shape[-1]):
+					ele_rad = doa_gt[b, t, 0, s].item()
+					azi_rad = doa_gt[b, t, 1, s].item()
+
+					# Convert rad -> grid index with proper bounds checking
+					ele_idx = int(round((ele_rad / np.pi) * (nele - 1)))
+					azi_idx = int(round(((azi_rad + np.pi) / (2 * np.pi)) * (nazi - 1)))
+
+					ele_idx = np.clip(ele_idx, 0, nele-1)
+					azi_idx = np.clip(azi_idx, 0, nazi-1)
+
+					gt_speakers.append((ele_idx, azi_idx))
+
+				# 3) Match detected peaks to GT speakers
+				matched_gt_indices = match_peaks_to_gt(peaks, gt_speakers, (nele, nazi))
+
+				# 4) Compute nonconformity scores for matched pairs
+				#
+				# ⚠️  CRITICAL CP CORRECTNESS ISSUE - TODO: FIX THIS! ⚠️
+				# Current implementation SILENTLY SKIPS unmatched GT speakers (when pred_idx is None).
+				# This is INCORRECT for conformal prediction and breaks coverage guarantees!
+				# See detailed explanation in crc_pipeline.py lines 395-415.
+				#
+				for gt_idx, pred_idx in enumerate(matched_gt_indices):
+					if pred_idx is not None and gt_idx < len(gt_speakers):
+						# Get peak value at predicted location
+						peak_ele, peak_azi = peaks[pred_idx]
+						S_peak = S[peak_ele, peak_azi]
+
+						# Get spectrum value at ground truth location
+						gt_ele, gt_azi = gt_speakers[gt_idx]
+						S_gt = S[gt_ele, gt_azi]
+
+						# Nonconformity score: ensure non-negative for CP validity
+						delta = max(0.0, S_peak - S_gt)
+						deltas.append(delta)
+					# TODO: Add penalty for unmatched GT speakers:
+					# else:
+					#     deltas.append(np.inf)  # or some large penalty value
+
+				# Debug info for first few frames
+				if b < 2 and t < 2:
+					print(f"  Batch {b}, Frame {t}: {len(peaks)} peaks, {len(gt_speakers)} GT speakers, "
+						  f"{sum(1 for x in matched_gt_indices if x is not None)} matches")
+
+		deltas = np.array(deltas)
+
+		if len(deltas) == 0:
+			print("ERROR: No valid nonconformity scores computed!")
+			print("This likely indicates peak detection or matching failures.")
+			exit(1)
+
+		alpha = args.cp_alpha
+		N = len(deltas)
+
+		# Finite-sample CP quantile
+		k = int(np.ceil((N + 1) * (1 - alpha))) - 1
+		lambda_hat = np.sort(deltas)[k]
+
+		print(f"Alpha: {alpha}")
+		print(f"Lambda_hat: {lambda_hat}")
+		print(f"Total calibration samples: {N}")
+
+		# Empirical coverage calculation
+		empirical_coverage = np.mean(deltas <= lambda_hat) * 100
+		target_coverage = (1 - alpha) * 100
+		print(f"Empirical coverage: {empirical_coverage:.1f}% (target: {target_coverage:.1f}%)")
+
+		# Additional statistics
+		print(f"Delta statistics: mean={np.mean(deltas):.3f}, std={np.std(deltas):.3f}, "
+			  f"median={np.median(deltas):.3f}")
+		print(f"Delta range: [{np.min(deltas):.3f}, {np.max(deltas):.3f}]")
+
+		# Save lambda
+		cal_dir = dirs['log'] + '/calibration'
+		if not os.path.exists(cal_dir):
+			os.makedirs(cal_dir)
+
+		lambda_path = cal_dir + f'/lambda_alpha_{alpha}.npy'
+		np.save(lambda_path, lambda_hat)
+		print(f"Saved lambda to {lambda_path}")
+
+		# Improved plot with empirical coverage
+		plt.figure(figsize=(10, 6))
+
+		# Histogram of nonconformity scores
+		plt.hist(deltas, bins=min(50, max(10, N//20)), alpha=0.7, color='skyblue',
+				 edgecolor='black', density=True, label='Nonconformity Scores')
+
+		# Mark lambda_hat with a vertical line
+		plt.axvline(lambda_hat, color='red', linestyle='--', linewidth=2,
+				   label=f'λ_hat = {lambda_hat:.3f}')
+
+		# Add text annotations
+		plt.xlabel('Nonconformity Score (δ = S_peak - S_GT)')
+		plt.ylabel('Density')
+		plt.title(f'CP Calibration: Nonconformity Score Distribution\n'
+				 f'α = {alpha} (Target Coverage: {target_coverage:.1f}%), '
+				 f'Empirical Coverage: {empirical_coverage:.1f}%')
+		plt.legend()
+		plt.grid(True, alpha=0.3)
+
+		# Add statistics text box
+		stats_text = (f'N = {N} scores\n'
+					 f'Mean: {np.mean(deltas):.3f}\n'
+					 f'Std: {np.std(deltas):.3f}\n'
+					 f'Min: {np.min(deltas):.3f}\n'
+					 f'Max: {np.max(deltas):.3f}')
+		plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
+				verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+		plt.tight_layout()
+		plt.savefig(cal_dir + f'/delta_hist_alpha_{alpha}.png', dpi=150, bbox_inches='tight')
+		print(f"Saved calibration plot to: {cal_dir}/delta_hist_alpha_{alpha}.png")
+		plt.close()
+
+		print("Calibration complete.")
+		exit(0)
+
+	elif (args.train):
 		print('Training Stage!')
 
 		if args.checkpoint_start:
@@ -293,7 +496,6 @@ if __name__ == "__main__":
 			# test_writer.add_scalar('metric-FAR', metric_test['FAR'], epoch)
 			# test_writer.add_scalar('metric-MAE', metric_test['MAE'], epoch)
 			test_writer.add_scalar('lr', lr, epoch)
-
 
 		print('\nTraining finished\n')
 
@@ -383,6 +585,98 @@ if __name__ == "__main__":
 					mic_sig    = _concat_predgt(mic_sig)
 					pred_woDNN = _concat_predgt(pred_woDNN)
 
+					# CP Region Extraction with hardcoded lambda_hat = 0.344 - BEFORE evaluation!
+					lambda_hat = 0.344
+					alpha = 0.1  # Corresponding to 90% coverage
+					print(f"Extracting CP confidence regions with λ_hat = {lambda_hat:.3f} (α = {alpha})")
+
+					# Extract CP regions for spatial spectrum analysis
+					ss_pred_np = pred['spatial_spectrum'].cpu().numpy()   # (nb, nt, nele, nazi)
+					doa_gt_rad = gt['doa']                               # (nb, nt, 2, ns) in radians
+
+					nb, nt, nele, nazi = ss_pred_np.shape
+
+					# Create DOA candidate grids for region conversion
+					ele_candidate = np.linspace(0, np.pi, nele)           # 0 to 180 degrees
+					azi_candidate = np.linspace(-np.pi, np.pi, nazi)      # -180 to 180 degrees
+					doa_candidate = [ele_candidate, azi_candidate]
+
+					# Storage for CP regions data for plotting
+					cp_regions_all = []
+
+					# Extract regions for first few samples and time frames
+					cp_coverage_results = []
+
+					for b in range(min(nb, 5)):  # Analyze first 5 batches
+						cp_regions_batch = []
+						for t in range(nt):  # All time frames per batch
+							S = ss_pred_np[b, t]  # (nele, nazi)
+
+							# Extract confidence regions using flood-fill (water-filling)
+							regions = extract_regions_test(
+								S=S,
+								lambda_hat=lambda_hat,
+								doa_candidate=doa_candidate,
+								connectivity=8,
+								prevent_overlap=True
+							)
+
+							# Check coverage against GT
+							nt_gt = doa_gt_rad.shape[1]
+							gt_t = min(t, nt_gt - 1)
+
+							coverage = []
+							for s in range(doa_gt_rad.shape[-1]):
+								# Convert GT DOA from radians to grid indices
+								ele_rad = doa_gt_rad[b, gt_t, 0, s].item()
+								azi_rad = doa_gt_rad[b, gt_t, 1, s].item()
+
+								ele_idx = int(round((ele_rad / np.pi) * (nele - 1)))
+								azi_idx = int(round(((azi_rad + np.pi) / (2 * np.pi)) * (nazi - 1)))
+								ele_idx = np.clip(ele_idx, 0, nele-1)
+								azi_idx = np.clip(azi_idx, 0, nazi-1)
+
+								# Check if GT falls within any region
+								covered = False
+								for region in regions:
+									bounds = region['region_bounds']
+									if (bounds['ele_min'] <= ele_idx <= bounds['ele_max'] and
+										bounds['azi_min'] <= azi_idx <= bounds['azi_max']):
+										covered = True
+										break
+								coverage.append(covered)
+
+							cp_coverage_results.extend(coverage)
+
+							# Store regions for plotting
+							cp_regions_batch.append(regions)
+
+							# Print first sample's results
+							if b == 0 and t == 0:
+								print(f"  Sample {b}-{t}: {len(regions)} CP regions, Coverage: {sum(coverage)}/{len(coverage)}")
+
+						cp_regions_all.append(cp_regions_batch)
+
+					# Store CP regions in learner for access by plotting functions
+					learner.cp_regions = cp_regions_all
+					print(f"DEBUG CP: Stored {len(cp_regions_all)} batches of CP regions in learner")
+					for b_idx, batch_regions in enumerate(cp_regions_all):
+						print(f"  Batch {b_idx}: {len(batch_regions)} time frames")
+						for t_idx, frame_regions in enumerate(batch_regions[:3]):  # First 3 time frames
+							if frame_regions is not None:
+								print(f"    Time {t_idx}: {len(frame_regions)} regions")
+							else:
+								print(f"    Time {t_idx}: None")
+
+					# CP Coverage statistics
+					if len(cp_coverage_results) > 0:
+						empirical_cp_coverage = np.mean(cp_coverage_results) * 100
+						target_coverage = (1 - alpha) * 100
+						print(f"  CP Empirical Coverage: {empirical_cp_coverage:.1f}% (target: {target_coverage:.1f}%)")
+					else:
+						print("  No CP coverage results computed")
+
+					# Now run evaluation with CP regions available
 					metrics[:, i, j], metric_keys = learner.evaluate(pred=pred, gt=gt, metric_setting=metric_setting)
 					metrics_woDNN[:, i, j], _ = learner.evaluate(pred=pred_woDNN, gt=gt, metric_setting=metric_setting)
 

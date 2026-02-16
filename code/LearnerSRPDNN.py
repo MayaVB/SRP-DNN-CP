@@ -198,6 +198,7 @@ class SourceTrackingFromSTFTLearner(Learner):
 			self.getmetric(doa_gt, vad_gt, doa_pred, vad_pred, ss_pred,
 				ae_mode = metric_setting['ae_mode'], ae_TH=metric_setting['ae_TH'],
 				useVAD=metric_setting['useVAD'], vad_TH=metric_setting['vad_TH'],
-				metric_unfold=metric_setting['metric_unfold'], burst_data=burst_data)
+				metric_unfold=metric_setting['metric_unfold'], burst_data=burst_data,
+				cp_regions=getattr(self, 'cp_regions', None))
 
 		return metric

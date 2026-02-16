@@ -45,6 +45,10 @@ class opt():
         parser.add_argument('--dirburst-snr', type=float, default=0.0, metavar='SNR', help='SNR of directional noise bursts in dB (default: 0.0)')
         parser.add_argument('--dirburst-color', type=str, default='white', choices=['white', 'pink'], metavar='COLOR', help='Color of directional noise bursts (default: white)')
 
+        # for CRC
+        parser.add_argument('--cp_calibration', action='store_true')
+        parser.add_argument('--cp_alpha', type=float, default=0.1)
+
         # for training stage
         parser.add_argument('--bs', type=int, nargs='+', default=[1,1,1], metavar='TrainValTestBatch', help='batch size for training, validation and test (default: 1, 1, 1)')
         parser.add_argument('--epochs', type=int, default=20, metavar='Epoch', help='number of epochs to train (default: 18)')
@@ -53,8 +57,11 @@ class opt():
         args = parser.parse_args()
         self.time = args.time
 
-        if (args.train + args.test)!=1:
-            raise Exception('Stage of train or test is unrecognized')
+        mode_count = int(args.train) + int(args.test) + int(args.cp_calibration)
+
+        if mode_count != 1:
+            raise Exception('Exactly one of --train, --test, or --cp_calibration must be set')
+
 
         return args
         
