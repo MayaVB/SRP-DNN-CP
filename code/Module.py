@@ -120,6 +120,19 @@ class getMetric(nn.Module):
 		self.inf = large_number
 		self.invlid_sidx = invalid_source_idx
 		self.eps = eps
+		self.cp_lambda_hat = None
+		self.cp_regions_computed = {}
+
+	def load_cp_lambda(self, calibration_dir, alpha=0.1):
+		"""Load calibrated lambda_hat from calibration directory"""
+		lambda_path = f"{calibration_dir}/lambda_alpha_{alpha}.npy"
+		try:
+			self.cp_lambda_hat = float(np.load(lambda_path))
+			print(f"Loaded CP lambda_hat = {self.cp_lambda_hat:.3f} from {lambda_path}")
+		except FileNotFoundError:
+			print(f"CP lambda file not found: {lambda_path}")
+			self.cp_lambda_hat = 0.291
+			print(f"Using fallback lambda_hat = {self.cp_lambda_hat}")
 
 	def forward(self, doa_gt, vad_gt, doa_est, vad_est, ss_pred, ae_mode, ae_TH=30, useVAD=True, vad_TH=[2/3, 0.3], metric_unfold=False, plot_trajectories=True, plot_heatmap=True, plot_save_dir=None, burst_data=None, cp_regions=None):
 		""" Args:
@@ -135,6 +148,9 @@ class getMetric(nn.Module):
 			Returns:
 				ACC, MAE or ACC, MDR, FA,R MAE, RMSE - [*, *, *]
 		"""
+		# Clear CP regions to avoid accumulation across evaluation calls
+		self.cp_regions_computed = {}
+
 		device = doa_gt.device
 		if ss_pred is not None:
 			if torch.is_tensor(ss_pred):
@@ -221,32 +237,6 @@ class getMetric(nn.Module):
 				vad_est_one = vad_est_one * vad_gt_sum
 				K_est = vad_est_one.sum(axis=1)
     
-				if plot_heatmap:
-					if ss_pred is not None:
-						nt_ss = int(ss_pred.shape[1])
-						plot_heatmap = (nt_ss == nt)
-						if (b_idx == 0) and (not plot_heatmap):
-							print(f"WARN heatmaps skipped: nt_ss={nt_ss} != nt={nt}")
-        
-					ss_1  = ss_pred[b_idx:b_idx+1]                 # (1, nt, nele, nazi)
-					doa_gt_1  = doa_gt_one.unsqueeze(0)            # (1, nt, 2, ns_gt)
-					doa_est_1 = doa_est_one.unsqueeze(0)           # (1, nt, 2, ns_est)
-
-					vad_gt_1  = vad_gt_one.unsqueeze(0)            # (1, nt, ns_gt)
-					vad_est_1 = vad_est_one.unsqueeze(0)           # (1, nt, ns_est)
-
-					self._plot_metric_heatmaps(
-						ss_pred_np=ss_1,
-						doa_gt=doa_gt_1,
-						vad_gt=vad_gt_1,
-						doa_est=doa_est_1,
-						vad_est=vad_est_1,
-						plot_save_dir=None,
-						b_idx=0,
-						save_b_idx=b_idx,
-						do_only_gt_active=False,
-						burst_data=burst_data,
-						cp_regions=cp_regions)
     
 				for t_idx in range(nt):
 					num_gt = int(K_gt[t_idx].item())
@@ -278,8 +268,111 @@ class getMetric(nn.Module):
 								azi_error[t_idx, src_idx] = dist_mat_az[src_idx, assignment[src_idx]]
 								ele_error[t_idx, src_idx] = dist_mat_el[src_idx, assignment[src_idx]]
 								aziele_error[t_idx, src_idx] = dist_mat_azel[src_idx, assignment[src_idx]]
+
+								# CP Region calculation for VALID assignments only
+								if hasattr(self, 'cp_lambda_hat') and self.cp_lambda_hat is not None and ss_pred is not None:
+									# Get validated peak location from assignment
+									est_peak_doa = doa_est_one[t_idx, :, assignment[src_idx]].cpu().numpy()  # [ele, azi] in degrees
+
+									# Convert to grid indices for water-filling
+									if isinstance(ss_pred, torch.Tensor):
+										spectrum = ss_pred[b_idx, t_idx].cpu().numpy()
+									else:
+										spectrum = ss_pred[b_idx, t_idx]
+									nele, nazi = spectrum.shape
+									peak_ele_idx = int(round((est_peak_doa[0] / 180.0) * (nele - 1)))
+									peak_azi_idx = int(round(((est_peak_doa[1] + 180.0) / 360.0) * (nazi - 1)))
+									peak_ele_idx = np.clip(peak_ele_idx, 0, nele-1)
+									peak_azi_idx = np.clip(peak_azi_idx, 0, nazi-1)
+
+									# Start water-filling from validated peak location
+									try:
+										from crc_pipeline import flood_fill_region
+										region_mask = flood_fill_region(spectrum, (peak_ele_idx, peak_azi_idx), self.cp_lambda_hat, connectivity=8)
+										region_size = np.sum(region_mask)
+										peak_value = spectrum[peak_ele_idx, peak_azi_idx]
+
+										# Store region info for plotting
+										region_info = {
+											'peak_position_idx': (peak_ele_idx, peak_azi_idx),
+											'peak_value': float(peak_value),
+											'region_mask': region_mask,
+											'region_size': int(region_size),
+											'threshold': float(peak_value - self.cp_lambda_hat),
+											'lambda_used': float(self.cp_lambda_hat),
+											'gt_assignment': src_idx,
+											'valid_assignment': True
+										}
+
+										# Add region bounds for plotting
+										if region_size > 1:
+											region_coords = np.where(region_mask)
+											region_info['region_bounds'] = {
+												'ele_min': int(np.min(region_coords[0])),
+												'ele_max': int(np.max(region_coords[0])),
+												'azi_min': int(np.min(region_coords[1])),
+												'azi_max': int(np.max(region_coords[1]))
+											}
+										else:
+											region_info['region_bounds'] = {
+												'ele_min': peak_ele_idx, 'ele_max': peak_ele_idx,
+												'azi_min': peak_azi_idx, 'azi_max': peak_azi_idx
+											}
+
+										# Store in structure for plotting
+										if b_idx not in self.cp_regions_computed:
+											self.cp_regions_computed[b_idx] = {}
+										if t_idx not in self.cp_regions_computed[b_idx]:
+											self.cp_regions_computed[b_idx][t_idx] = []
+
+										self.cp_regions_computed[b_idx][t_idx].append(region_info)
+
+										print(f"CP region for valid assignment: batch={b_idx}, time={t_idx}, src={src_idx}, size={region_size}")
+										print(f"DEBUG CP: Stored region in cp_regions_computed[{b_idx}][{t_idx}], total regions: {len(self.cp_regions_computed[b_idx][t_idx])}")
+									except Exception as e:
+										print(f"CP region calculation failed: {e}")
     
 				K_corr = corr_flag.sum(axis=1)
+
+				# Plot heatmaps AFTER all CP regions are computed for this batch
+				if plot_heatmap:
+					if ss_pred is not None:
+						nt_ss = int(ss_pred.shape[1])
+						plot_heatmap = (nt_ss == nt)
+						if (b_idx == 0) and (not plot_heatmap):
+							print(f"WARN heatmaps skipped: nt_ss={nt_ss} != nt={nt}")
+
+					ss_1  = ss_pred[b_idx:b_idx+1]                 # (1, nt, nele, nazi)
+					doa_gt_1  = doa_gt_one.unsqueeze(0)            # (1, nt, 2, ns_gt)
+					doa_est_1 = doa_est_one.unsqueeze(0)           # (1, nt, 2, ns_est)
+
+					vad_gt_1  = vad_gt_one.unsqueeze(0)            # (1, nt, ns_gt)
+					vad_est_1 = vad_est_one.unsqueeze(0)           # (1, nt, ns_est)
+
+					# Use computed CP regions if available, otherwise use passed regions
+					regions_to_plot = self.cp_regions_computed if hasattr(self, 'cp_regions_computed') and len(self.cp_regions_computed) > 0 else cp_regions
+					print(f"DEBUG CP: Using regions_to_plot - computed: {hasattr(self, 'cp_regions_computed')}, len: {len(self.cp_regions_computed) if hasattr(self, 'cp_regions_computed') else 'N/A'}, passed: {cp_regions is not None}")
+
+					# Detailed debug for current batch
+					if hasattr(self, 'cp_regions_computed') and b_idx in self.cp_regions_computed:
+						print(f"DEBUG CP: Batch {b_idx} has {len(self.cp_regions_computed[b_idx])} time frames with CP regions")
+						for t_key, regions in self.cp_regions_computed[b_idx].items():
+							print(f"DEBUG CP: Batch {b_idx}, time {t_key}: {len(regions)} regions")
+					else:
+						print(f"DEBUG CP: Batch {b_idx} has NO CP regions computed")
+
+					self._plot_metric_heatmaps(
+						ss_pred_np=ss_1,
+						doa_gt=doa_gt_1,
+						vad_gt=vad_gt_1,
+						doa_est=doa_est_1,
+						vad_est=vad_est_1,
+						plot_save_dir=None,
+						b_idx=0,
+						save_b_idx=b_idx,
+						do_only_gt_active=False,
+						burst_data=burst_data,
+						cp_regions=regions_to_plot)
 
 				den = K_gt.sum(axis=0) + self.eps
 				acc[b_idx, :] = K_corr.sum(axis=0) / den
@@ -750,22 +843,18 @@ class getMetric(nn.Module):
 			# overlay CP REGIONS
 			print(f"DEBUG CP: cp_regions is None? {cp_regions is None}")
 			if cp_regions is not None:
-				print(f"DEBUG CP: len(cp_regions)={len(cp_regions)}, save_b_idx={save_b_idx}, t_idx={t_idx}")
-				if save_b_idx < len(cp_regions):
-					print(f"DEBUG CP: len(cp_regions[{save_b_idx}])={len(cp_regions[save_b_idx])}")
-					if t_idx < len(cp_regions[save_b_idx]):
-						regions_for_frame = cp_regions[save_b_idx][t_idx]
-						print(f"DEBUG CP: regions_for_frame is None? {regions_for_frame is None}")
-						if regions_for_frame is not None:
-							print(f"DEBUG CP: Found {len(regions_for_frame)} CP regions to plot!")
-						else:
-							print("DEBUG CP: regions_for_frame is None")
+				print(f"DEBUG CP: Looking for save_b_idx={save_b_idx}, t_idx={t_idx}")
+				print(f"DEBUG CP: Available batch keys: {list(cp_regions.keys())}")
+				if save_b_idx in cp_regions:
+					print(f"DEBUG CP: Available time keys for batch {save_b_idx}: {list(cp_regions[save_b_idx].keys())}")
+					if t_idx in cp_regions[save_b_idx]:
+						print(f"DEBUG CP: Found regions for batch {save_b_idx}, time {t_idx}!")
 					else:
-						print(f"DEBUG CP: t_idx {t_idx} >= len(cp_regions[{save_b_idx}]) {len(cp_regions[save_b_idx])}")
+						print(f"DEBUG CP: t_idx {t_idx} not found in batch {save_b_idx}")
 				else:
-					print(f"DEBUG CP: save_b_idx {save_b_idx} >= len(cp_regions) {len(cp_regions)}")
+					print(f"DEBUG CP: batch {save_b_idx} not found in available keys")
 
-			if cp_regions is not None and save_b_idx < len(cp_regions) and t_idx < len(cp_regions[save_b_idx]):
+			if cp_regions is not None and save_b_idx in cp_regions and t_idx in cp_regions[save_b_idx]:
 				regions_for_frame = cp_regions[save_b_idx][t_idx]
 				if regions_for_frame is not None:
 					# Get grid dimensions

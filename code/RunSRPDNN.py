@@ -35,7 +35,7 @@ import ModelSRPDNN as at_model
 import Module as at_module
 from Dataset import Parameter
 from utils import set_seed, set_random_seed, set_learning_rate
-from crc_pipeline import find_top2_peaks, match_peaks_to_gt, extract_regions_test
+from crc_pipeline import find_top2_peaks, match_peaks_to_gt
 
 if __name__ == "__main__":
 	use_cuda = not args.no_cuda and torch.cuda.is_available()
@@ -299,6 +299,9 @@ if __name__ == "__main__":
 
 		ss_pred = pred['spatial_spectrum'].cpu().numpy()   # (nb, nt, nele, nazi)
 		doa_gt  = gt['doa']                                # (nb, nt, 2, ns)
+		doa_pred = pred['doa'].cpu().numpy()               # (nb, nt, 2, ns)
+		vad_gt = gt['vad_sources'].cpu().numpy()           # (nb, nt, ns)
+		vad_pred = pred['vad_sources'].cpu().numpy()       # (nb, nt, ns)
 
 		nb, nt, nele, nazi = ss_pred.shape
 
@@ -311,63 +314,86 @@ if __name__ == "__main__":
 
 		print(f"Processing {nb} batches with {nt} time frames each...")
 
+		# Use exact same evaluation logic as Module.py for calibration
+		metric_setting = {'ae_mode':['azi', 'ele'], 'ae_TH':30, 'useVAD':False, 'vad_TH':[2/3, 0.0]}
+
 		for b in range(nb):
+			# Convert tensors for this batch
+			doa_gt_deg = doa_gt[b] * 180 / np.pi  # (nt, 2, ns) convert to degrees
+			doa_pred_deg = torch.from_numpy(doa_pred[b] * 180 / np.pi)  # (nt, 2, ns)
+			vad_gt_one = torch.from_numpy(vad_gt[b])  # (nt, ns)
+			vad_pred_one = torch.from_numpy(vad_pred[b])  # (nt, ns)
+
 			for t in range(nt):
-				S = ss_pred[b, t]  # (nele, nazi)
+				# Apply same evaluation logic as Module.py lines 267-280
+				num_gt = int(vad_gt_one[t].sum().item()) if metric_setting['useVAD'] else doa_gt.shape[-1]
+				num_est = int(vad_pred_one[t].sum().item()) if metric_setting['useVAD'] else doa_pred.shape[-1]
 
-				# 1) Detect top-2 peaks using proper peak detection
-				peaks = find_top2_peaks(S, suppress_radius=(3, 3))
+				if num_gt > 0 and num_est > 0:
+					# Get active sources (same as Module.py)
+					if metric_setting['useVAD']:
+						est = doa_pred_deg[t, :, vad_pred_one[t] > metric_setting['vad_TH'][1]]
+						gt = doa_gt_deg[t, :, vad_gt_one[t] > metric_setting['vad_TH'][0]]
+					else:
+						est = doa_pred_deg[t, :, :]  # All sources
+						gt = doa_gt_deg[t, :, :]
 
-				if len(peaks) == 0:
-					print(f"Warning: No peaks found in batch {b}, frame {t}")
-					continue  # Skip frames with no detected peaks
+					# Build distance matrix (same as Module.py)
+					dist_mat_az = torch.zeros((num_gt, num_est))
+					for gt_idx in range(num_gt):
+						for est_idx in range(num_est):
+							# Angular distance calculation
+							az_diff = torch.abs((est[1, est_idx] - gt[1, gt_idx] + 180) % 360 - 180)
+							dist_mat_az[gt_idx, est_idx] = az_diff
 
-				# 2) Convert GT DOA to grid indices for all speakers in this frame
-				gt_speakers = []
-				for s in range(doa_gt.shape[-1]):
-					ele_rad = doa_gt[b, t, 0, s].item()
-					azi_rad = doa_gt[b, t, 1, s].item()
+					# Apply Hungarian algorithm with thresholds (same as Module.py)
+					invalid_assigns = dist_mat_az > metric_setting['ae_TH']
+					dist_mat_az_bak = dist_mat_az.clone()
+					dist_mat_az_bak[invalid_assigns] = 10000  # Large number
 
-					# Convert rad -> grid index with proper bounds checking
-					ele_idx = int(round((ele_rad / np.pi) * (nele - 1)))
-					azi_idx = int(round(((azi_rad + np.pi) / (2 * np.pi)) * (nazi - 1)))
+					from scipy.optimize import linear_sum_assignment
+					assignment = list(linear_sum_assignment(dist_mat_az_bak))
 
-					ele_idx = np.clip(ele_idx, 0, nele-1)
-					azi_idx = np.clip(azi_idx, 0, nazi-1)
+					# Judge assignment quality (same as Module.py)
+					final_assignment = torch.tensor([10 for i in range(dist_mat_az.shape[0])])  # invalid_idx = 10
+					for i in range(min(dist_mat_az.shape[0], dist_mat_az.shape[1])):
+						if dist_mat_az_bak[assignment[0][i], assignment[1][i]] != 10000:
+							final_assignment[assignment[0][i]] = assignment[1][i]
 
-					gt_speakers.append((ele_idx, azi_idx))
+					# Compute nonconformity scores for VALID assignments only
+					S = ss_pred[b, t]  # (nele, nazi)
+					for src_idx in range(num_gt):
+						if final_assignment[src_idx] != 10:  # Valid assignment
+							# Get validated peak location from assignment
+							if metric_setting['useVAD']:
+								est_indices = torch.where(vad_pred_one[t] > metric_setting['vad_TH'][1])[0]
+								est_peak_doa = doa_pred_deg[t, :, est_indices[final_assignment[src_idx]]].numpy()
+								gt_indices = torch.where(vad_gt_one[t] > metric_setting['vad_TH'][0])[0]
+								gt_doa = doa_gt_deg[t, :, gt_indices[src_idx]]
+							else:
+								est_peak_doa = doa_pred_deg[t, :, final_assignment[src_idx]].numpy()
+								gt_doa = doa_gt_deg[t, :, src_idx]
 
-				# 3) Match detected peaks to GT speakers
-				matched_gt_indices = match_peaks_to_gt(peaks, gt_speakers, (nele, nazi))
+							# Convert to grid indices
+							peak_ele_idx = int(round((est_peak_doa[0] / 180.0) * (nele - 1)))
+							peak_azi_idx = int(round(((est_peak_doa[1] + 180.0) / 360.0) * (nazi - 1)))
+							peak_ele_idx = np.clip(peak_ele_idx, 0, nele-1)
+							peak_azi_idx = np.clip(peak_azi_idx, 0, nazi-1)
 
-				# 4) Compute nonconformity scores for matched pairs
-				#
-				# ⚠️  CRITICAL CP CORRECTNESS ISSUE - TODO: FIX THIS! ⚠️
-				# Current implementation SILENTLY SKIPS unmatched GT speakers (when pred_idx is None).
-				# This is INCORRECT for conformal prediction and breaks coverage guarantees!
-				# See detailed explanation in crc_pipeline.py lines 395-415.
-				#
-				for gt_idx, pred_idx in enumerate(matched_gt_indices):
-					if pred_idx is not None and gt_idx < len(gt_speakers):
-						# Get peak value at predicted location
-						peak_ele, peak_azi = peaks[pred_idx]
-						S_peak = S[peak_ele, peak_azi]
+							gt_ele_idx = int(round((gt_doa[0].item() / 180.0) * (nele - 1)))
+							gt_azi_idx = int(round(((gt_doa[1].item() + 180.0) / 360.0) * (nazi - 1)))
+							gt_ele_idx = np.clip(gt_ele_idx, 0, nele-1)
+							gt_azi_idx = np.clip(gt_azi_idx, 0, nazi-1)
 
-						# Get spectrum value at ground truth location
-						gt_ele, gt_azi = gt_speakers[gt_idx]
-						S_gt = S[gt_ele, gt_azi]
-
-						# Nonconformity score: ensure non-negative for CP validity
-						delta = max(0.0, S_peak - S_gt)
-						deltas.append(delta)
-					# TODO: Add penalty for unmatched GT speakers:
-					# else:
-					#     deltas.append(np.inf)  # or some large penalty value
+							# Nonconformity score: spectrum difference
+							S_peak = S[peak_ele_idx, peak_azi_idx]
+							S_gt = S[gt_ele_idx, gt_azi_idx]
+							delta = max(0.0, S_peak - S_gt)
+							deltas.append(delta)
 
 				# Debug info for first few frames
 				if b < 2 and t < 2:
-					print(f"  Batch {b}, Frame {t}: {len(peaks)} peaks, {len(gt_speakers)} GT speakers, "
-						  f"{sum(1 for x in matched_gt_indices if x is not None)} matches")
+					print(f"  Batch {b}, Frame {t}: evaluation-based calibration, {len(deltas)} scores so far")
 
 		deltas = np.array(deltas)
 
@@ -585,98 +611,11 @@ if __name__ == "__main__":
 					mic_sig    = _concat_predgt(mic_sig)
 					pred_woDNN = _concat_predgt(pred_woDNN)
 
-					# CP Region Extraction with hardcoded lambda_hat = 0.344 - BEFORE evaluation!
-					lambda_hat = 0.344
-					alpha = 0.1  # Corresponding to 90% coverage
-					print(f"Extracting CP confidence regions with λ_hat = {lambda_hat:.3f} (α = {alpha})")
+					# Load CP lambda_hat in getMetric for evaluation-based CP calculation
+					cal_dir = dirs['log'] + '/calibration'
+					learner.getmetric.load_cp_lambda(cal_dir, alpha=args.cp_alpha)
 
-					# Extract CP regions for spatial spectrum analysis
-					ss_pred_np = pred['spatial_spectrum'].cpu().numpy()   # (nb, nt, nele, nazi)
-					doa_gt_rad = gt['doa']                               # (nb, nt, 2, ns) in radians
-
-					nb, nt, nele, nazi = ss_pred_np.shape
-
-					# Create DOA candidate grids for region conversion
-					ele_candidate = np.linspace(0, np.pi, nele)           # 0 to 180 degrees
-					azi_candidate = np.linspace(-np.pi, np.pi, nazi)      # -180 to 180 degrees
-					doa_candidate = [ele_candidate, azi_candidate]
-
-					# Storage for CP regions data for plotting
-					cp_regions_all = []
-
-					# Extract regions for first few samples and time frames
-					cp_coverage_results = []
-
-					for b in range(min(nb, 5)):  # Analyze first 5 batches
-						cp_regions_batch = []
-						for t in range(nt):  # All time frames per batch
-							S = ss_pred_np[b, t]  # (nele, nazi)
-
-							# Extract confidence regions using flood-fill (water-filling)
-							regions = extract_regions_test(
-								S=S,
-								lambda_hat=lambda_hat,
-								doa_candidate=doa_candidate,
-								connectivity=8,
-								prevent_overlap=True
-							)
-
-							# Check coverage against GT
-							nt_gt = doa_gt_rad.shape[1]
-							gt_t = min(t, nt_gt - 1)
-
-							coverage = []
-							for s in range(doa_gt_rad.shape[-1]):
-								# Convert GT DOA from radians to grid indices
-								ele_rad = doa_gt_rad[b, gt_t, 0, s].item()
-								azi_rad = doa_gt_rad[b, gt_t, 1, s].item()
-
-								ele_idx = int(round((ele_rad / np.pi) * (nele - 1)))
-								azi_idx = int(round(((azi_rad + np.pi) / (2 * np.pi)) * (nazi - 1)))
-								ele_idx = np.clip(ele_idx, 0, nele-1)
-								azi_idx = np.clip(azi_idx, 0, nazi-1)
-
-								# Check if GT falls within any region
-								covered = False
-								for region in regions:
-									bounds = region['region_bounds']
-									if (bounds['ele_min'] <= ele_idx <= bounds['ele_max'] and
-										bounds['azi_min'] <= azi_idx <= bounds['azi_max']):
-										covered = True
-										break
-								coverage.append(covered)
-
-							cp_coverage_results.extend(coverage)
-
-							# Store regions for plotting
-							cp_regions_batch.append(regions)
-
-							# Print first sample's results
-							if b == 0 and t == 0:
-								print(f"  Sample {b}-{t}: {len(regions)} CP regions, Coverage: {sum(coverage)}/{len(coverage)}")
-
-						cp_regions_all.append(cp_regions_batch)
-
-					# Store CP regions in learner for access by plotting functions
-					learner.cp_regions = cp_regions_all
-					print(f"DEBUG CP: Stored {len(cp_regions_all)} batches of CP regions in learner")
-					for b_idx, batch_regions in enumerate(cp_regions_all):
-						print(f"  Batch {b_idx}: {len(batch_regions)} time frames")
-						for t_idx, frame_regions in enumerate(batch_regions[:3]):  # First 3 time frames
-							if frame_regions is not None:
-								print(f"    Time {t_idx}: {len(frame_regions)} regions")
-							else:
-								print(f"    Time {t_idx}: None")
-
-					# CP Coverage statistics
-					if len(cp_coverage_results) > 0:
-						empirical_cp_coverage = np.mean(cp_coverage_results) * 100
-						target_coverage = (1 - alpha) * 100
-						print(f"  CP Empirical Coverage: {empirical_cp_coverage:.1f}% (target: {target_coverage:.1f}%)")
-					else:
-						print("  No CP coverage results computed")
-
-					# Now run evaluation with CP regions available
+					# CP regions will now be computed directly during evaluation
 					metrics[:, i, j], metric_keys = learner.evaluate(pred=pred, gt=gt, metric_setting=metric_setting)
 					metrics_woDNN[:, i, j], _ = learner.evaluate(pred=pred_woDNN, gt=gt, metric_setting=metric_setting)
 
