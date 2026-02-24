@@ -45,6 +45,12 @@ class opt():
         parser.add_argument('--dirburst-snr', type=float, default=0.0, metavar='SNR', help='SNR of directional noise bursts in dB (default: 0.0)')
         parser.add_argument('--dirburst-color', type=str, default='white', choices=['white', 'pink'], metavar='COLOR', help='Color of directional noise bursts (default: white)')
 
+        # NPZ spectrum dump
+        parser.add_argument('--dump-npz', action='store_true', default=False,
+                            help='Export per-example SRP spectra and DOA to a single .npz (use with --test)')
+        parser.add_argument('--dump-dir', type=str, default='', metavar='DumpDir',
+                            help='Root directory for .npz output. File saved to <dump-dir>/Reverb_<T60ms>_ms_SNR_<SNR>_dB/speakers_2.npz')
+
         # for CRC
         parser.add_argument('--cp_calibration', action='store_true')
         parser.add_argument('--cp_alpha', type=float, default=0.1)

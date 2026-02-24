@@ -8,9 +8,21 @@ from copy import deepcopy
 from itertools import permutations
 from scipy.optimize import linear_sum_assignment
 import os
+from crc_pipeline import (
+    find_top2_peaks,
+    create_voronoi_masks,
+    flood_fill_region_threshold,   # NEW function you must have in crc_pipeline
+    angles_to_idx                  # optional if you still need GT->idx
+)
 
 
 # %% Complex number operations
+def _normalize_spectrum(self, S: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    S = np.asarray(S, dtype=np.float32)
+    Smin = float(S.min())
+    Smax = float(S.max())
+    return (S - Smin) / (Smax - Smin + eps)
+
 
 def complex_multiplication(x, y):
 	return torch.stack([ x[...,0]*y[...,0] - x[...,1]*y[...,1],   x[...,0]*y[...,1] + x[...,1]*y[...,0]  ], dim=-1)
@@ -159,7 +171,7 @@ class getMetric(nn.Module):
 				ss_pred = np.asarray(ss_pred)
 		else:
 			ss_pred = None
-    
+		plot_trajectories = False
 		# Generate trajectory plots if requested
 		if plot_trajectories:
 			self._plot_metric_trajectories(doa_gt, vad_gt, doa_est, vad_est, ae_TH, vad_TH, useVAD, plot_save_dir, burst_data)
@@ -237,10 +249,68 @@ class getMetric(nn.Module):
 				vad_est_one = vad_est_one * vad_gt_sum
 				K_est = vad_est_one.sum(axis=1)
     
-    
 				for t_idx in range(nt):
 					num_gt = int(K_gt[t_idx].item())
 					num_est = int(K_est[t_idx].item())
+     
+					# CP regions (NEW definition)
+					if (self.cp_lambda_hat is not None) and (ss_pred is not None):
+						# spectrum for this frame
+						spectrum = ss_pred[b_idx, t_idx]  # (nele, nazi), numpy
+						S_norm = self._normalize_spectrum(spectrum)
+
+						# peaks from SRP spectrum (top-2)
+						peaks = find_top2_peaks(S_norm, suppress_radius=(3, 3))
+
+						# optional: prevent overlap between regions
+						vor_masks = None
+						if len(peaks) > 1:
+							vor_masks = create_voronoi_masks(peaks, S_norm.shape)
+
+						# build regions for each peak using calibrated absolute threshold lambda_hat
+						regions_frame = []
+						for p_idx, (pe, pa) in enumerate(peaks):
+							mask_v = vor_masks[p_idx] if vor_masks is not None else None
+							region_mask = flood_fill_region_threshold(
+								S_norm,
+								peak_idx=(pe, pa),
+								lambda_thr=float(self.cp_lambda_hat),
+								connectivity=8,
+								voronoi_mask=mask_v
+							)
+							region_size = int(np.sum(region_mask))
+							region_info = {
+								"peak_position_idx": (int(pe), int(pa)),
+								"peak_value": float(S_norm[pe, pa]),
+								"region_mask": region_mask,
+								"region_size": region_size,
+								"threshold": float(self.cp_lambda_hat),      # NOTE: now absolute threshold
+								"lambda_used": float(self.cp_lambda_hat),
+								"valid_assignment": True
+							}
+
+							# bounds for plotting
+							if region_size > 1:
+								coords = np.where(region_mask)
+								region_info["region_bounds"] = {
+									"ele_min": int(coords[0].min()),
+									"ele_max": int(coords[0].max()),
+									"azi_min": int(coords[1].min()),
+									"azi_max": int(coords[1].max()),
+								}
+							else:
+								region_info["region_bounds"] = {
+									"ele_min": int(pe), "ele_max": int(pe),
+									"azi_min": int(pa), "azi_max": int(pa),
+								}
+
+							regions_frame.append(region_info)
+
+						# store for plotting (batch/time)
+						if b_idx not in self.cp_regions_computed:
+							self.cp_regions_computed[b_idx] = {}
+						self.cp_regions_computed[b_idx][t_idx] = regions_frame
+     
 					if num_gt>0 and num_est>0:
 						est = doa_est_one[t_idx, :, vad_est_one[t_idx,:]>0]
 						gt = doa_gt_one[t_idx, :, vad_gt_one[t_idx,:]>0]
@@ -269,71 +339,8 @@ class getMetric(nn.Module):
 								ele_error[t_idx, src_idx] = dist_mat_el[src_idx, assignment[src_idx]]
 								aziele_error[t_idx, src_idx] = dist_mat_azel[src_idx, assignment[src_idx]]
 
-								# CP Region calculation for VALID assignments only
-								if hasattr(self, 'cp_lambda_hat') and self.cp_lambda_hat is not None and ss_pred is not None:
-									# Get validated peak location from assignment
-									est_peak_doa = doa_est_one[t_idx, :, assignment[src_idx]].cpu().numpy()  # [ele, azi] in degrees
-
-									# Convert to grid indices for water-filling
-									if isinstance(ss_pred, torch.Tensor):
-										spectrum = ss_pred[b_idx, t_idx].cpu().numpy()
-									else:
-										spectrum = ss_pred[b_idx, t_idx]
-									nele, nazi = spectrum.shape
-									peak_ele_idx = int(round((est_peak_doa[0] / 180.0) * (nele - 1)))
-									peak_azi_idx = int(round(((est_peak_doa[1] + 180.0) / 360.0) * (nazi - 1)))
-									peak_ele_idx = np.clip(peak_ele_idx, 0, nele-1)
-									peak_azi_idx = np.clip(peak_azi_idx, 0, nazi-1)
-
-									# Start water-filling from validated peak location
-									try:
-										from crc_pipeline import flood_fill_region
-										region_mask = flood_fill_region(spectrum, (peak_ele_idx, peak_azi_idx), self.cp_lambda_hat, connectivity=8)
-										region_size = np.sum(region_mask)
-										peak_value = spectrum[peak_ele_idx, peak_azi_idx]
-
-										# Store region info for plotting
-										region_info = {
-											'peak_position_idx': (peak_ele_idx, peak_azi_idx),
-											'peak_value': float(peak_value),
-											'region_mask': region_mask,
-											'region_size': int(region_size),
-											'threshold': float(peak_value - self.cp_lambda_hat),
-											'lambda_used': float(self.cp_lambda_hat),
-											'gt_assignment': src_idx,
-											'valid_assignment': True
-										}
-
-										# Add region bounds for plotting
-										if region_size > 1:
-											region_coords = np.where(region_mask)
-											region_info['region_bounds'] = {
-												'ele_min': int(np.min(region_coords[0])),
-												'ele_max': int(np.max(region_coords[0])),
-												'azi_min': int(np.min(region_coords[1])),
-												'azi_max': int(np.max(region_coords[1]))
-											}
-										else:
-											region_info['region_bounds'] = {
-												'ele_min': peak_ele_idx, 'ele_max': peak_ele_idx,
-												'azi_min': peak_azi_idx, 'azi_max': peak_azi_idx
-											}
-
-										# Store in structure for plotting
-										if b_idx not in self.cp_regions_computed:
-											self.cp_regions_computed[b_idx] = {}
-										if t_idx not in self.cp_regions_computed[b_idx]:
-											self.cp_regions_computed[b_idx][t_idx] = []
-
-										self.cp_regions_computed[b_idx][t_idx].append(region_info)
-
-										print(f"CP region for valid assignment: batch={b_idx}, time={t_idx}, src={src_idx}, size={region_size}")
-										print(f"DEBUG CP: Stored region in cp_regions_computed[{b_idx}][{t_idx}], total regions: {len(self.cp_regions_computed[b_idx][t_idx])}")
-									except Exception as e:
-										print(f"CP region calculation failed: {e}")
-    
 				K_corr = corr_flag.sum(axis=1)
-
+				plot_heatmap = False
 				# Plot heatmaps AFTER all CP regions are computed for this batch
 				if plot_heatmap:
 					if ss_pred is not None:
@@ -730,10 +737,19 @@ class getMetric(nn.Module):
 
 		# Calculate global min/max for consistent heatmap scaling across all time frames (log scale)
 		# Add small epsilon to avoid log(0)
-		eps = 1e-10
-		ss_log = 10*np.log10(ss_pred_np[b_idx] + eps)
-		vmin = np.min(ss_log)
-		vmax = np.max(ss_log)
+		# --- compute S_norm for plotting (same as CP) ---
+		S0 = ss_pred_np[b_idx]  # (nt, nele, nazi)
+		Smin = np.min(S0)
+		Smax = np.max(S0)
+		S_norm_all = (S0 - Smin) / (Smax - Smin + 1e-12)   # global-per-sequence normalization
+
+		# --- plot in dB of normalized map ---
+		eps = 1e-6
+		ss_log = 10*np.log10(S_norm_all + eps)
+
+		# robust color limits (avoid 1 crazy pixel ruining the scale)
+		vmin = np.percentile(ss_log, 5)
+		vmax = np.percentile(ss_log, 99.5)
 
 		if (save_b_idx == 0) and (burst_data is not None):
 			# burst_data is now a list for each batch sample
@@ -764,8 +780,8 @@ class getMetric(nn.Module):
 			if do_only_gt_active and (vad_gt_b[t_idx].sum().item() == 0):
 				continue
 
-			hm = ss_pred_np[b_idx, t_idx, :, :]  # (nele, nazi)
-			hm_log = 10*np.log10(hm + eps)  # Apply log transform (dB scale)
+			# hm = ss_pred_np[b_idx, t_idx, :, :]  # (nele, nazi)
+			hm_log = ss_log[t_idx]
 
 			plt.figure(figsize=(8, 6))
 			plt.imshow(
@@ -777,7 +793,7 @@ class getMetric(nn.Module):
 				vmin=vmin,
 				vmax=vmax
 			)
-			plt.colorbar(label="SS score (dB)")
+			plt.colorbar(label="SS (dB, normalized)")
 
 			# overlay GT
 			gt_active = torch.where(vad_gt_b[t_idx])[0]
@@ -1170,13 +1186,19 @@ class SourceDetectLocalize(nn.Module):
 		pred_DOAs = torch.zeros((nb, nt, 2, self.max_num_sources), dtype=torch.float32, requires_grad=False).to(device)
 		pred_VADs = torch.zeros((nb, nt, self.max_num_sources), dtype=torch.float32, requires_grad=False).to(device)
 
+		iter_maps = None  # per-iteration IDL maps, set below in IDL mode only
+
 		if self.meth_mode == 'IDL': # iterative source detection and localization
-			
+			iter_maps_list = []  # capture map at each IDL iteration before subtraction
+
 			for source_idx in range(self.max_num_sources):
 				map = torch.bmm(pred_ipd.contiguous().view(nb, nt, -1),
 								dpipd_template.contiguous().view(nb, nele, nazi, -1).permute(0, 3, 1, 2).view(nb, nmic * nf, -1)) / (
 									nmic * nf / 2)  # (nb, nt, nele*nazi)
 				map = map.view(nb, nt, nele, nazi)
+
+				# Capture residual spectrum BEFORE argmax/subtraction (shape: nb, nt, nele, nazi)
+				iter_maps_list.append(map.detach().cpu().numpy().astype(np.float32))
 
 				max_flat_idx = map.reshape((nb, nt, -1)).argmax(2)
 				ele_max_idx, azi_max_idx = np.unravel_index(max_flat_idx.cpu().numpy(), map.shape[2:])  # (nb, nt)
@@ -1202,6 +1224,9 @@ class SourceDetectLocalize(nn.Module):
 						elif self.source_num_mode == 'unkNum':
 							pred_VADs[b_idx, t_idx, source_idx] = ratio * 1
 				pred_ipd = pred_ipd - max_dpipd_template
+
+			# Stack per-iteration maps: (K, nb, nt, nele, nazi)
+			iter_maps = np.stack(iter_maps_list, axis=0)
 
 		elif self.meth_mode =='PD': # peak detection
 			ss = deepcopy(pred_ss[:,:,:,0:-1]) # redundant azi
@@ -1265,7 +1290,7 @@ class SourceDetectLocalize(nn.Module):
 		# 			pair_idx_sim = torch.argmin(diff)
 		# 			pred_DOAs[b_idx, t_idx + 1, :, :] = torch.stack(pair_permute[pair_idx_sim]).permute(1,0)
 
-		return pred_DOAs, pred_VADs, pred_ss
+		return pred_DOAs, pred_VADs, pred_ss, iter_maps
 
 
 class GCC(nn.Module):

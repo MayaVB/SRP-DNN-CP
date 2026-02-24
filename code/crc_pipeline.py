@@ -2,13 +2,24 @@
 Conformal Risk Control (CRC) Pipeline for Multi-Speaker Localization
 using SRP Spatial Spectrum.
 
-This module implements a conformal prediction approach for controlling
-localization risk by building confidence regions around detected speaker peaks.
+NEW (2026-02):
+- Calibration is now WATER-FILL / FLOOD-FILL REGION based on an ABSOLUTE threshold lambda in [0,1]
+- We normalize each spatial spectrum S -> S_norm in [0,1]
+- For each validated peak (matched to GT within ae_TH_deg), we grow/shrink a connected region:
+      region(lambda) = connected component containing the peak within { S_norm >= lambda }
+  (optionally restricted to the peak's Voronoi cell to prevent overlaps)
+- For each matched GT, define lambda_star = largest lambda for which GT is still inside region(lambda)
+- Choose lambda_hat as the finite-sample alpha-quantile of lambda_star such that:
+      P(GT inside region(lambda_hat)) ≈ 1 - alpha
+
+This file is meant to fully replace the old delta-based calibration.
 """
+
+from __future__ import annotations
 
 import numpy as np
 from collections import deque
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 
 # Optional import for plotting - gracefully handle missing matplotlib
 try:
@@ -18,1002 +29,841 @@ except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
 
+# ============================================================
+# Index <-> Angle conversion (FIXED azimuth grid)
+# ============================================================
+
+def idx_to_angles(ele_idx: int, azi_idx: int, nele: int, nazi: int) -> Tuple[float, float]:
+    """
+    Convert grid indices -> degrees.
+
+    Elevation is assumed to be a closed grid [0, 180] with nele bins (includes endpoints).
+    Azimuth is assumed to be a circular grid [-180, 180) with nazi bins (endpoint excluded).
+    This matches: np.linspace(-180, 180, nazi, endpoint=False)
+    """
+    ele_deg = (ele_idx / (nele - 1)) * 180.0
+    azi_deg = (azi_idx / nazi) * 360.0 - 180.0  # divide by nazi (not nazi-1)
+    return float(ele_deg), float(azi_deg)
+
+
+def angles_to_idx(ele_deg: float, azi_deg: float, nele: int, nazi: int) -> Tuple[int, int]:
+    """
+    Convert degrees -> grid indices.
+
+    Elevation: clamp to [0,180], mapped to [0, nele-1]
+    Azimuth: wrap to [-180,180), mapped to [0, nazi-1] circularly.
+    """
+    # Elevation: closed interval
+    ele_deg = float(np.clip(ele_deg, 0.0, 180.0))
+    ele_idx = int(np.round((ele_deg / 180.0) * (nele - 1)))
+    ele_idx = int(np.clip(ele_idx, 0, nele - 1))
+
+    # Azimuth: wrap to [-180, 180)
+    azi_deg = float(((azi_deg + 180.0) % 360.0) - 180.0)
+    azi_idx = int(np.round(((azi_deg + 180.0) / 360.0) * nazi)) % nazi
+    return ele_idx, azi_idx
+
+
+def wrap_azi_diff(a: float, b: float) -> float:
+    """Minimal circular absolute azimuth diff in degrees."""
+    return float(abs((a - b + 180.0) % 360.0 - 180.0))
+
+
+# ============================================================
+# Normalization (NEW)
+# ============================================================
+
+def normalize_map(S: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Normalize spectrum to [0,1] per-frame.
+
+    NOTE: If S is constant, returns all zeros.
+    """
+    S = np.asarray(S, dtype=np.float32)
+    mn = float(np.min(S))
+    mx = float(np.max(S))
+    denom = (mx - mn)
+    if denom < eps:
+        return np.zeros_like(S, dtype=np.float32)
+    return (S - mn) / (denom + eps)
+
+
+# ============================================================
+# Peak detection (same logic)
+# ============================================================
+
 def find_top2_peaks(S: np.ndarray, suppress_radius: Tuple[int, int] = (3, 3)) -> List[Tuple[int, int]]:
     """
-    Find the top 2 peaks in the spatial spectrum using 8-neighbor peak detection.
-
-    Args:
-        S: Spatial spectrum array of shape (nele, nazi)
-        suppress_radius: (r_ele, r_azi) radius for suppressing around first peak
-
-    Returns:
-        List of (ele_idx, azi_idx) tuples for top 2 peaks
-        Returns as [(ele1, azi1), (ele2, azi2)]
+    Find the top 2 peaks in the spatial spectrum using 8-neighbor strict peak detection.
+    Returns list of (ele_idx, azi_idx), length <= 2.
     """
     nele, nazi = S.shape
     r_ele, r_azi = suppress_radius
 
-    # Helper function for azimuth wraparound distance
     def azi_distance(a1, a2, n_azi):
-        """Compute minimum distance considering azimuth wraparound."""
         diff = abs(a1 - a2)
         return min(diff, n_azi - diff)
 
-    # Create neighbor arrays using modulo indexing for azimuth wraparound
-    def get_neighbor_values(S, d_ele, d_azi):
-        """Get neighbor values with boundary handling."""
-        nele, nazi = S.shape
-        neighbors = np.zeros_like(S)
-
-        for e in range(nele):
-            for a in range(nazi):
+    def get_neighbor_values(S_, d_ele, d_azi):
+        nele_, nazi_ = S_.shape
+        neighbors = np.zeros_like(S_, dtype=np.float32)
+        for e in range(nele_):
+            for a in range(nazi_):
                 ne = e + d_ele
-                na = (a + d_azi) % nazi  # Azimuth wraparound
-
-                # Handle elevation boundaries
-                if 0 <= ne < nele:
-                    neighbors[e, a] = S[ne, na]
+                na = (a + d_azi) % nazi_
+                if 0 <= ne < nele_:
+                    neighbors[e, a] = S_[ne, na]
                 else:
-                    neighbors[e, a] = -np.inf  # Invalid neighbor
-
+                    neighbors[e, a] = -np.inf
         return neighbors
 
-    # Get all 8 neighbors
     neighbors = [
-        get_neighbor_values(S, -1, -1),  # top-left
-        get_neighbor_values(S, -1,  0),  # top
-        get_neighbor_values(S, -1,  1),  # top-right
-        get_neighbor_values(S,  0, -1),  # left
-        get_neighbor_values(S,  0,  1),  # right
-        get_neighbor_values(S,  1, -1),  # bottom-left
-        get_neighbor_values(S,  1,  0),  # bottom
-        get_neighbor_values(S,  1,  1),  # bottom-right
+        get_neighbor_values(S, -1, -1),
+        get_neighbor_values(S, -1,  0),
+        get_neighbor_values(S, -1,  1),
+        get_neighbor_values(S,  0, -1),
+        get_neighbor_values(S,  0,  1),
+        get_neighbor_values(S,  1, -1),
+        get_neighbor_values(S,  1,  0),
+        get_neighbor_values(S,  1,  1),
     ]
 
-    # Find local maxima: point is peak if greater than all neighbors
     is_peak = np.ones((nele, nazi), dtype=bool)
     for neighbor in neighbors:
         is_peak &= (S > neighbor)
 
-    # Get peak candidates
     peak_indices = np.where(is_peak)
 
-    # Fallback to global maximum if no local maxima found
     if len(peak_indices[0]) == 0:
-        print("Warning: No local maxima found, falling back to global argmax")
-        flat_idx = np.argmax(S)
+        # fallback to global argmax
+        flat_idx = int(np.argmax(S))
         peak1 = np.unravel_index(flat_idx, S.shape)
-        peak_indices = ([peak1[0]], [peak1[1]])
+        peak_indices = (np.array([peak1[0]]), np.array([peak1[1]]))
 
     peak_values = S[peak_indices]
     sorted_idx = np.argsort(peak_values)[::-1]
-    sorted_peaks = [(peak_indices[0][i], peak_indices[1][i]) for i in sorted_idx]
+    sorted_peaks = [(int(peak_indices[0][i]), int(peak_indices[1][i])) for i in sorted_idx]
 
     if len(sorted_peaks) == 0:
         return []
 
-    # Take the highest peak
     peak1 = sorted_peaks[0]
     result = [peak1]
-
-    # Find second peak with suppression
     peak1_ele, peak1_azi = peak1
 
     for peak_candidate in sorted_peaks[1:]:
         peak2_ele, peak2_azi = peak_candidate
-
-        # Check distance from first peak
         ele_dist = abs(peak2_ele - peak1_ele)
         azi_dist = azi_distance(peak2_azi, peak1_azi, nazi)
-
         if ele_dist > r_ele or azi_dist > r_azi:
             result.append(peak_candidate)
             break
     else:
-        print(f"Warning: Second peak too close to first peak at ({peak1_ele}, {peak1_azi})")
-
-        # Fallback: find second global maximum with suppression
+        # fallback: suppress around peak1 and take next argmax
         S_suppressed = S.copy()
-
-        # Suppress region around peak1
         for e in range(max(0, peak1_ele - r_ele), min(nele, peak1_ele + r_ele + 1)):
             for a_offset in range(-r_azi, r_azi + 1):
                 a = (peak1_azi + a_offset) % nazi
                 S_suppressed[e, a] = -np.inf
-
-        # Find second peak
-        flat_idx2 = np.argmax(S_suppressed)
+        flat_idx2 = int(np.argmax(S_suppressed))
         peak2 = np.unravel_index(flat_idx2, S_suppressed.shape)
-
-        if S_suppressed[peak2] > -np.inf:  # Valid second peak
-            result.append(peak2)
+        if S_suppressed[peak2] > -np.inf:
+            result.append((int(peak2[0]), int(peak2[1])))
 
     return result[:2]
 
 
-def flood_fill_region(S: np.ndarray, peak_idx: Tuple[int, int], lambda_val: float,
-                     connectivity: int = 8, voronoi_mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Build a connected region around a peak using flood-fill algorithm with BFS.
-
-    Starting from peak position, include neighbors if their spectrum value
-    is >= peak_value - lambda_val. Continue expanding until no more neighbors
-    satisfy the condition.
-
-    Args:
-        S: Spatial spectrum array of shape (nele, nazi)
-        peak_idx: (ele_idx, azi_idx) position of the peak
-        lambda_val: Threshold parameter controlling region size
-        connectivity: 4 or 8 neighbor connectivity
-        voronoi_mask: Optional binary mask of shape (nele, nazi) defining the
-                     Voronoi cell for this peak. Region expansion is limited
-                     to this mask to prevent overlapping regions.
-
-    Returns:
-        Binary mask of shape (nele, nazi) where True indicates points in the region
-    """
-    nele, nazi = S.shape
-    peak_ele, peak_azi = peak_idx
-
-    # Validate peak position
-    if not (0 <= peak_ele < nele and 0 <= peak_azi < nazi):
-        raise ValueError(f"Peak position {peak_idx} is outside spectrum bounds {S.shape}")
-
-    # Initialize region mask and visited set
-    region_mask = np.zeros((nele, nazi), dtype=bool)
-    visited = np.zeros((nele, nazi), dtype=bool)
-
-    # Threshold for inclusion in region
-    peak_value = S[peak_ele, peak_azi]
-    threshold = peak_value - lambda_val
-
-    # BFS queue using deque for efficient operations
-    queue = deque([(peak_ele, peak_azi)])
-    region_mask[peak_ele, peak_azi] = True
-    visited[peak_ele, peak_azi] = True
-
-    # Define neighbor offsets based on connectivity
-    if connectivity == 4:
-        # 4-connected (cardinal directions)
-        neighbor_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    elif connectivity == 8:
-        # 8-connected (cardinal + diagonal)
-        neighbor_offsets = [(-1, -1), (-1, 0), (-1, 1),
-                           (0, -1),           (0, 1),
-                           (1, -1),  (1, 0),  (1, 1)]
-    else:
-        raise ValueError(f"Connectivity must be 4 or 8, got {connectivity}")
-
-    # BFS flood-fill
-    while queue:
-        curr_ele, curr_azi = queue.popleft()  # Remove from front (BFS)
-
-        # Check all neighbors
-        for d_ele, d_azi in neighbor_offsets:
-            next_ele = curr_ele + d_ele
-            next_azi = (curr_azi + d_azi) % nazi  # Handle azimuth wraparound
-
-            # Handle elevation boundaries safely
-            if not (0 <= next_ele < nele):
-                continue  # Skip out of bounds in elevation
-
-            # Skip if already visited
-            if visited[next_ele, next_azi]:
-                continue
-
-            # Check Voronoi ownership if provided
-            if voronoi_mask is not None and not voronoi_mask[next_ele, next_azi]:
-                continue  # Skip if outside this peak's Voronoi cell
-
-            # Mark as visited
-            visited[next_ele, next_azi] = True
-
-            # Check threshold condition
-            if S[next_ele, next_azi] >= threshold:
-                # Include in region and add to queue for further expansion
-                region_mask[next_ele, next_azi] = True
-                queue.append((next_ele, next_azi))
-
-    return region_mask
-
+# ============================================================
+# Voronoi masks (optional overlap prevention)
+# ============================================================
 
 def create_voronoi_masks(peaks: List[Tuple[int, int]], spectrum_shape: Tuple[int, int]) -> List[np.ndarray]:
     """
-    Create Voronoi ownership masks for multiple peaks to prevent region overlap.
-
-    Args:
-        peaks: List of (ele_idx, azi_idx) tuples for peak positions
-        spectrum_shape: (nele, nazi) shape of the spatial spectrum
-
-    Returns:
-        List of binary masks, one for each peak, defining Voronoi cells
+    Very simple Voronoi in INDEX space (ele,azi grid distances),
+    with circular wrap in azimuth index.
     """
     if len(peaks) == 0:
         return []
 
     nele, nazi = spectrum_shape
-    masks = []
+    masks: List[np.ndarray] = []
 
-    # Helper function for azimuth wraparound distance
     def azi_distance(a1, a2, n_azi):
         diff = abs(a1 - a2)
         return min(diff, n_azi - diff)
 
-    for peak_idx, peak_pos in enumerate(peaks):
+    for peak_idx, _ in enumerate(peaks):
         mask = np.zeros((nele, nazi), dtype=bool)
-
         for e in range(nele):
             for a in range(nazi):
-                # Find closest peak to this position
                 min_dist = np.inf
                 closest_peak_idx = -1
-
                 for other_idx, other_pos in enumerate(peaks):
-                    # Distance to this peak
                     ele_dist = abs(e - other_pos[0])
                     azi_dist = azi_distance(a, other_pos[1], nazi)
                     total_dist = np.sqrt(ele_dist**2 + azi_dist**2)
-
                     if total_dist < min_dist:
                         min_dist = total_dist
                         closest_peak_idx = other_idx
-
-                # Assign to this peak's Voronoi cell
                 if closest_peak_idx == peak_idx:
                     mask[e, a] = True
-
         masks.append(mask)
 
     return masks
 
 
-def match_peaks_to_gt(pred_peaks: List[Tuple[int, int]],
-                     gt_positions: List[Tuple[int, int]],
-                     spectrum_shape: Optional[Tuple[int, int]] = None) -> List[Optional[int]]:
+# ============================================================
+# Flood fill (NEW absolute-threshold semantics)
+# ============================================================
+
+def flood_fill_region_threshold(
+    S_norm: np.ndarray,
+    peak_idx: Tuple[int, int],
+    thr: float,
+    connectivity: int = 8,
+    voronoi_mask: Optional[np.ndarray] = None
+) -> np.ndarray:
     """
-    Match predicted peaks to ground truth positions using brute-force over permutations.
-
-    Args:
-        pred_peaks: List of (ele_idx, azi_idx) tuples for predicted peaks
-        gt_positions: List of (ele_idx, azi_idx) tuples for ground truth positions
-        spectrum_shape: (nele, nazi) for azimuth wraparound distance calculation
-
-    Returns:
-        List of matched GT indices for each predicted peak (None if no match)
-        matched_pred_for_gt = [pred_for_gt1, pred_for_gt2]
+    Connected component containing peak_idx within the set { S_norm >= thr }.
+    - S_norm must be in [0,1]
+    - thr must be in [0,1] (values outside are clipped)
+    - If S_norm[peak] < thr -> returns empty mask (all False)
     """
-    if len(pred_peaks) == 0 or len(gt_positions) == 0:
-        return [None] * len(gt_positions)
+    S_norm = np.asarray(S_norm, dtype=np.float32)
+    nele, nazi = S_norm.shape
+    pe, pa = peak_idx
 
-    # Helper function for azimuth wraparound distance
-    def azi_distance(a1, a2, n_azi):
-        """Compute minimum distance considering azimuth wraparound."""
-        if n_azi is None:
-            return abs(a1 - a2)  # No wraparound
-        diff = abs(a1 - a2)
-        return min(diff, n_azi - diff)
+    if not (0 <= pe < nele and 0 <= pa < nazi):
+        raise ValueError(f"Peak {peak_idx} outside S shape {S_norm.shape}")
+
+    thr = float(np.clip(thr, 0.0, 1.0))
+
+    # If seed itself is below threshold, region is empty
+    if float(S_norm[pe, pa]) < thr:
+        return np.zeros((nele, nazi), dtype=bool)
+
+    region_mask = np.zeros((nele, nazi), dtype=bool)
+    visited = np.zeros((nele, nazi), dtype=bool)
+
+    if connectivity == 4:
+        neighbor_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    elif connectivity == 8:
+        neighbor_offsets = [(-1, -1), (-1, 0), (-1, 1),
+                            (0, -1),           (0, 1),
+                            (1, -1),  (1, 0),  (1, 1)]
+    else:
+        raise ValueError(f"Connectivity must be 4 or 8, got {connectivity}")
+
+    q = deque([(pe, pa)])
+    visited[pe, pa] = True
+    region_mask[pe, pa] = True
+
+    while q:
+        ce, ca = q.popleft()
+        for de, da in neighbor_offsets:
+            ne = ce + de
+            na = (ca + da) % nazi  # wrap in azimuth index
+
+            if not (0 <= ne < nele):
+                continue
+            if visited[ne, na]:
+                continue
+            if voronoi_mask is not None and not voronoi_mask[ne, na]:
+                visited[ne, na] = True
+                continue
+
+            visited[ne, na] = True
+            if float(S_norm[ne, na]) >= thr:
+                region_mask[ne, na] = True
+                q.append((ne, na))
+
+    return region_mask
+
+
+# ============================================================
+# Matching peaks to GT in DEGREES (validation gate A)
+# ============================================================
+
+def match_peaks_to_gt_degrees(
+    pred_peaks: List[Tuple[int, int]],
+    gt_angles_deg: List[Tuple[float, float]],
+    nele: int,
+    nazi: int,
+    ae_TH_deg: float = 30.0,
+    use_elevation: bool = False
+) -> List[Optional[int]]:
+    """
+    Match GT speakers (given in degrees) to predicted peaks (indices),
+    using small Hungarian/bruteforce (<=2x2) in degrees.
+    Returns list length = len(gt_angles_deg), each entry is peak index or None (invalid).
+
+    Cost:
+      - default: azimuth wrap diff
+      - if use_elevation: sqrt(az^2 + el^2)
+    """
+    if len(pred_peaks) == 0 or len(gt_angles_deg) == 0:
+        return [None] * len(gt_angles_deg)
 
     n_pred = min(len(pred_peaks), 2)
-    n_gt = min(len(gt_positions), 2)
+    n_gt = min(len(gt_angles_deg), 2)
 
-    if n_pred == 0 or n_gt == 0:
-        return [None] * len(gt_positions)
+    pred_peaks = pred_peaks[:n_pred]
+    gt_angles_deg = gt_angles_deg[:n_gt]
 
-    # Convert to numpy for easier computation
-    pred_array = np.array(pred_peaks[:n_pred])  # Shape: (n_pred, 2)
-    gt_array = np.array(gt_positions[:n_gt])     # Shape: (n_gt, 2)
+    pred_ang = [idx_to_angles(pe, pa, nele, nazi) for (pe, pa) in pred_peaks]  # (ele,azi) deg
+    gt_ang = [(float(el), float(az)) for (el, az) in gt_angles_deg]
 
-    # Get azimuth dimension for wraparound
-    nazi = spectrum_shape[1] if spectrum_shape is not None else None
+    C = np.zeros((n_gt, n_pred), dtype=np.float32)
+    for gi in range(n_gt):
+        gt_el, gt_az = gt_ang[gi]
+        for pj in range(n_pred):
+            pr_el, pr_az = pred_ang[pj]
+            az = wrap_azi_diff(pr_az, gt_az)
+            if use_elevation:
+                el = abs(pr_el - gt_el)
+                C[gi, pj] = float(np.sqrt(az**2 + el**2))
+            else:
+                C[gi, pj] = float(az)
 
-    # Compute cost matrix using distance in index space with azimuth wraparound
-    cost_matrix = np.zeros((n_gt, n_pred))
+    # brute force assignments for <=2
+    assignment: List[Optional[int]] = [None] * n_gt
+    if n_gt == 1 and n_pred == 1:
+        assignment = [0]
+    elif n_gt == 2 and n_pred == 2:
+        cost1 = C[0, 0] + C[1, 1]
+        cost2 = C[0, 1] + C[1, 0]
+        assignment = [0, 1] if cost1 <= cost2 else [1, 0]
+    elif n_gt == 1 and n_pred == 2:
+        assignment = [0 if C[0, 0] <= C[0, 1] else 1]
+    elif n_gt == 2 and n_pred == 1:
+        assignment = [0, None] if C[0, 0] <= C[1, 0] else [None, 0]
 
-    for gt_idx in range(n_gt):
-        for pred_idx in range(n_pred):
-            gt_ele, gt_azi = gt_array[gt_idx]
-            pred_ele, pred_azi = pred_array[pred_idx]
+    # validation gate by ae_TH_deg
+    for gi in range(n_gt):
+        pj = assignment[gi]
+        if pj is None:
+            continue
+        if float(C[gi, pj]) > float(ae_TH_deg):
+            assignment[gi] = None
 
-            # Elevation distance (no wraparound)
-            ele_diff = abs(pred_ele - gt_ele)
-
-            # Azimuth distance (with wraparound if spectrum_shape provided)
-            azi_diff = azi_distance(pred_azi, gt_azi, nazi)
-
-            # Combined distance in index space
-            cost_matrix[gt_idx, pred_idx] = np.sqrt(ele_diff**2 + azi_diff**2)
-
-    # Brute-force over permutations for small cases
-    best_assignment = [None] * n_gt
-
-    if n_pred == 1 and n_gt == 1:
-        best_assignment = [0]
-    elif n_pred == 2 and n_gt == 2:
-        # Two permutations: (0,1) and (1,0)
-        cost1 = cost_matrix[0, 0] + cost_matrix[1, 1]  # GT0->Pred0, GT1->Pred1
-        cost2 = cost_matrix[0, 1] + cost_matrix[1, 0]  # GT0->Pred1, GT1->Pred0
-
-        if cost1 <= cost2:
-            best_assignment = [0, 1]
-        else:
-            best_assignment = [1, 0]
-    elif n_pred == 2 and n_gt == 1:
-        # One GT, two predictions - pick best
-        if cost_matrix[0, 0] <= cost_matrix[0, 1]:
-            best_assignment = [0]
-        else:
-            best_assignment = [1]
-    elif n_pred == 1 and n_gt == 2:
-        # Two GT, one prediction - assign to closest
-        if cost_matrix[0, 0] <= cost_matrix[1, 0]:
-            best_assignment = [0, None]
-        else:
-            best_assignment = [None, 0]
-
-    # Extend result to match original input size
-    result = best_assignment.copy()
-    while len(result) < len(gt_positions):
+    # extend to original len(gt_angles_deg) if >2 later
+    result = assignment.copy()
+    while len(result) < len(gt_angles_deg):
         result.append(None)
+    return result
 
-    return result[:len(gt_positions)]
 
+# ============================================================
+# Calibration (NEW): lambda_star + alpha-quantile => lambda_hat
+# ============================================================
 
-def compute_lambda_cp(spectra_cal: List[np.ndarray], gt_cal: List[List[Tuple[int, int]]], alpha: float = 0.1, plot_calibration: bool = False) -> Tuple[float, np.ndarray]:
+def _lambda_star_for_one_gt(
+    S_norm: np.ndarray,
+    peak_idx: Tuple[int, int],
+    gt_idx: Tuple[int, int],
+    lambda_grid: np.ndarray,
+    connectivity: int = 8,
+    voronoi_mask: Optional[np.ndarray] = None
+) -> float:
     """
-    Compute lambda using conformal prediction for desired coverage.
-
-    For each calibration frame and each speaker:
-    1) Detect top-2 peaks in spectrum S
-    2) Match predicted peaks to GT speakers
-    3) Compute nonconformity score: delta = S_peak - S_at_GT
-
-    Then compute lambda_hat as the (1-alpha) quantile of all deltas.
-
-    Args:
-        spectra_cal: List of spatial spectra, each of shape (nele, nazi)
-        gt_cal: List of GT speaker positions for each frame, each containing
-               list of (ele_idx, azi_idx) tuples for speakers in that frame
-        alpha: Miscoverage rate (e.g., 0.1 for 90% coverage)
-        plot_calibration: If True, create calibration plots (requires matplotlib)
-
-    Returns:
-        lambda_hat: Threshold parameter for desired coverage
-        deltas: Array of all nonconformity scores
+    Scan lambda in increasing order. Region shrinks as lambda increases.
+    Return lambda_star = largest lambda for which GT is inside region(lambda).
+    If GT not even inside at lambda=0 -> return 0.0
+    If GT inside for all lambdas up to 1 -> return 1.0
     """
-    deltas = []
+    ge, ga = gt_idx
+    nele, nazi = S_norm.shape
+    if not (0 <= ge < nele and 0 <= ga < nazi):
+        return 0.0
 
-    print(f"Computing conformal prediction lambda with alpha={alpha} (target coverage={(1-alpha)*100:.1f}%)")
-    print(f"Processing {len(spectra_cal)} calibration frames...")
-
-    for frame_idx, (spectrum, gt_speakers) in enumerate(zip(spectra_cal, gt_cal)):
-        if len(gt_speakers) == 0:
-            continue  # Skip frames with no speakers
-
-        # 1) Detect top-2 peaks
-        peaks = find_top2_peaks(spectrum, suppress_radius=(3, 3))
-
-        if len(peaks) == 0:
-            continue  # Skip if no peaks found
-
-        # 2) Match predicted peaks to GT speakers
-        matched_gt_indices = match_peaks_to_gt(peaks, gt_speakers, spectrum.shape)
-
-        # 3) Compute nonconformity scores for matched pairs
-        #
-        # ⚠️  CRITICAL CP CORRECTNESS ISSUE - TODO: FIX THIS! ⚠️
-        #
-        # Current implementation SILENTLY SKIPS unmatched GT speakers (when pred_idx is None).
-        # This is INCORRECT for conformal prediction and breaks coverage guarantees!
-        #
-        # Why this is wrong:
-        # - CP requires exactly ONE nonconformity score per calibration example
-        # - If a GT speaker is missed by peak detection, that's a FAILURE, not something to ignore
-        # - By skipping missed speakers, we underestimate the true risk
-        # - This leads to overly optimistic lambda_hat values
-        # - Coverage guarantee becomes FALSE
-        #
-        # Correct behavior should be:
-        # if pred_idx is None:
-        #     delta = np.inf  # or some very large penalty value
-        #     deltas.append(delta)
-        # else:
-        #     # compute normal delta = max(0.0, S_peak - S_at_GT)
-        #
-        # This ensures that missed detections are properly penalized in the quantile calculation.
-        #
-        for gt_idx, pred_idx in enumerate(matched_gt_indices):
-            if pred_idx is not None and gt_idx < len(gt_speakers):
-                # Get peak value at predicted location
-                peak_ele, peak_azi = peaks[pred_idx]
-                S_peak = spectrum[peak_ele, peak_azi]
-
-                # Get spectrum value at ground truth location
-                gt_ele, gt_azi = gt_speakers[gt_idx]
-                S_at_GT = spectrum[gt_ele, gt_azi]
-
-                # Nonconformity score: ensure non-negative values for conformal prediction
-                delta = max(0.0, S_peak - S_at_GT)
-                deltas.append(delta)
-            # TODO: Add the missing case:
-            # else:
-            #     deltas.append(np.inf)  # Penalty for missed GT speaker
-
-                if frame_idx < 3:  # Debug info for first few frames
-                    print(f"  Frame {frame_idx}, Speaker {gt_idx}: "
-                          f"Peak@{peaks[pred_idx]} ({S_peak:.3f}) - GT@{gt_speakers[gt_idx]} ({S_at_GT:.3f}) = {delta:.3f}")
-
-    deltas = np.array(deltas)
-
-    if len(deltas) == 0:
-        print("Warning: No valid nonconformity scores computed!")
-        return 0.0, deltas
-
-    print(f"Collected {len(deltas)} nonconformity scores")
-    print(f"Delta range: [{np.min(deltas):.3f}, {np.max(deltas):.3f}]")
-
-    # Compute conformal prediction quantile with finite-sample correction
-    n = len(deltas)
-    # Standard conformal prediction quantile index
-    index = int(np.ceil((n + 1) * (1 - alpha))) - 1  # -1 for 0-based indexing
-    index = max(0, min(index, n - 1))  # Clamp to valid range
-
-    # Sort deltas and get quantile
-    sorted_deltas = np.sort(deltas)
-    lambda_hat = sorted_deltas[index]
-
-    print(f"Conformal quantile index: {index+1}/{n} (corrected for finite sample)")
-    print(f"Lambda_hat = {lambda_hat:.3f}")
-
-    # Empirical coverage calculation
-    empirical_coverage = np.mean(deltas <= lambda_hat) * 100
-    target_coverage = (1 - alpha) * 100
-    print(f"Empirical coverage: {empirical_coverage:.1f}% (target: {target_coverage:.1f}%)")
-
-    # Create calibration plots if requested
-    if plot_calibration:
-        if not MATPLOTLIB_AVAILABLE:
-            print("Warning: matplotlib not available, skipping plots")
+    last_ok = None
+    for lam in lambda_grid:
+        mask = flood_fill_region_threshold(S_norm, peak_idx, float(lam), connectivity, voronoi_mask)
+        if mask[ge, ga]:
+            last_ok = float(lam)
         else:
-            # Create histogram of deltas with lambda_hat marked
-            plt.figure(figsize=(10, 6))
+            # since lambda increases => region only shrinks, once it fails, it will fail for larger lambda
+            break
 
-            # Histogram of nonconformity scores
-            plt.hist(deltas, bins=30, alpha=0.7, color='skyblue', edgecolor='black', density=True)
-
-            # Mark lambda_hat with a vertical line
-            plt.axvline(lambda_hat, color='red', linestyle='--', linewidth=2,
-                       label=f'λ_hat = {lambda_hat:.3f}')
-
-            # Add text annotations
-            plt.xlabel('Nonconformity Score (δ = S_peak - S_GT)')
-            plt.ylabel('Density')
-            plt.title(f'Calibration: Nonconformity Score Distribution\n'
-                     f'α = {alpha} (Target Coverage: {target_coverage:.1f}%), '
-                     f'Empirical Coverage: {empirical_coverage:.1f}%')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-
-            # Add statistics text box
-            stats_text = (f'n = {n} scores\n'
-                         f'Mean: {np.mean(deltas):.3f}\n'
-                         f'Std: {np.std(deltas):.3f}\n'
-                         f'Min: {np.min(deltas):.3f}\n'
-                         f'Max: {np.max(deltas):.3f}')
-            plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-            plt.tight_layout()
-
-            # Save figure instead of showing
-            filename = f'calibration_plot_alpha_{alpha:.3f}.png'
-            plt.savefig(filename, dpi=150, bbox_inches='tight')
-            print(f"Calibration plot saved to: {filename}")
-            plt.close()  # Close figure to free memory
-
-    return lambda_hat, deltas
+    if last_ok is None:
+        return 0.0
+    return float(last_ok)
 
 
-def extract_regions_test(S: np.ndarray,
-                        lambda_hat: float,
-                        doa_candidate: Optional[List[np.ndarray]] = None,
-                        connectivity: int = 8,
-                        prevent_overlap: bool = True) -> List[Dict]:
+def calibrate_lambda_waterfill(
+    spectra_cal: List[np.ndarray],
+    doa_gt_deg_cal: List[np.ndarray],
+    vad_gt_cal: Optional[List[np.ndarray]] = None,
+    alpha: float = 0.1,
+    ae_TH_deg: float = 30.0,
+    use_elevation_in_cost: bool = False,
+    prevent_overlap: bool = True,
+    connectivity: int = 8,
+    suppress_radius: Tuple[int, int] = (3, 3),
+    lambda_grid: Optional[np.ndarray] = None,
+    plot_calibration: bool = False
+) -> Dict[str, Any]:
     """
-    Extract confidence regions for test data using learned lambda.
+    Calibrate lambda_hat for the WATER-FILL region method.
 
-    This is the test stage of conformal prediction: apply the learned lambda_hat
-    to new test data to get confidence regions around detected speakers.
+    Inputs per frame k:
+      - spectra_cal[k]: (nele,nazi) spectrum
+      - doa_gt_deg_cal[k]: (2,ns) degrees, where [0,:]=ele, [1,:]=azi
+      - vad_gt_cal[k] (optional): (ns,) 0/1 or bool; if provided, only active GT are used.
+        If vad_gt_cal is None -> uses all GT sources in doa_gt_deg_cal.
 
-    Args:
-        S: Spatial spectrum of shape (nele, nazi)
-        lambda_hat: Learned threshold parameter from calibration
-        doa_candidate: Optional [ele_candidate, azi_candidate] arrays in radians
-                      for converting indices to degrees. If None, returns indices.
-        connectivity: 4 or 8 neighbor connectivity for flood-fill
-        prevent_overlap: If True, use Voronoi cells to prevent region overlap
+    Procedure:
+      1) Normalize S -> S_norm in [0,1]
+      2) Detect top2 peaks
+      3) Match peaks <-> active GT in degrees with ae_TH_deg gate (validated peaks only)
+      4) For each matched (GT,peak), compute lambda_star = largest lambda such that GT in region(lambda)
+      5) lambda_hat = finite-sample alpha-quantile of lambda_star:
+           k = ceil((n+1)*alpha) - 1
+           lambda_hat = sorted(lambda_star)[k]
+         so that P(GT inside region(lambda_hat)) ≈ 1-alpha
 
-    Returns:
-        List of region dictionaries, each containing:
-            - 'peak_position_idx': (ele_idx, azi_idx) in array indices
-            - 'peak_position_deg': (ele_deg, azi_deg) in degrees (if doa_candidate provided)
-            - 'peak_value': Spectrum value at peak
-            - 'region_mask': Binary mask of shape (nele, nazi)
-            - 'region_size': Number of pixels in region
-            - 'threshold': Actual threshold used (peak_value - lambda_hat)
-            - 'weighted_centroid': Weighted centroid using spectrum values
+    Returns dict with:
+      - lambda_hat
+      - lambda_stars (np.ndarray)
+      - n_frames, n_gt_used, n_matched
+      - (optional) coverage_curve: (lambda_grid, coverage)
     """
-    nele, nazi = S.shape
+    if lambda_grid is None:
+        # Dense grid (hard calculation, no tricks)
+        lambda_grid = np.linspace(0.0, 1.0, 1001, dtype=np.float32)
+    else:
+        lambda_grid = np.asarray(lambda_grid, dtype=np.float32)
+        lambda_grid = np.clip(lambda_grid, 0.0, 1.0)
 
-    # 1) Find top-2 peaks in spatial spectrum
-    peaks = find_top2_peaks(S, suppress_radius=(3, 3))
+    lambda_stars: List[float] = []
+    n_frames = 0
+    n_gt_used = 0
+    n_matched = 0
 
-    if len(peaks) == 0:
-        print("Warning: No peaks found in test spectrum")
-        return []
+    for k, S in enumerate(spectra_cal):
+        n_frames += 1
+        S = np.asarray(S)
+        nele, nazi = S.shape
 
-    # 2) Create Voronoi masks to prevent region overlap if requested
-    voronoi_masks = None
-    if prevent_overlap and len(peaks) > 1:
-        voronoi_masks = create_voronoi_masks(peaks, S.shape)
+        # normalize
+        S_norm = normalize_map(S)
 
-    regions = []
+        # peaks on normalized map (recommended)
+        peaks = find_top2_peaks(S_norm, suppress_radius=suppress_radius)
+        if len(peaks) == 0:
+            continue
 
-    # 3) Apply flood-fill with lambda_hat around each peak
-    for peak_idx, (peak_ele, peak_azi) in enumerate(peaks):
-        peak_value = S[peak_ele, peak_azi]
+        # active GT angles (degrees)
+        gt_angles_all = np.asarray(doa_gt_deg_cal[k], dtype=np.float32)
+        if gt_angles_all.ndim != 2 or gt_angles_all.shape[0] != 2:
+            raise ValueError(f"doa_gt_deg_cal[{k}] must have shape (2,ns), got {gt_angles_all.shape}")
+        ns = gt_angles_all.shape[1]
 
-        # Get Voronoi mask for this peak
-        mask = voronoi_masks[peak_idx] if voronoi_masks is not None else None
+        if vad_gt_cal is not None:
+            vad = np.asarray(vad_gt_cal[k]).astype(bool).reshape(-1)
+            if vad.shape[0] != ns:
+                raise ValueError(f"vad_gt_cal[{k}] length {vad.shape[0]} != ns {ns}")
+            active_idx = np.where(vad)[0].tolist()
+        else:
+            active_idx = list(range(ns))
 
-        # Apply flood-fill to get confidence region
-        region_mask = flood_fill_region(S, (peak_ele, peak_azi), lambda_hat, connectivity, mask)
-        region_size = np.sum(region_mask)
+        if len(active_idx) == 0:
+            continue
 
-        # Create region dictionary
-        region_info = {
-            'peak_position_idx': (peak_ele, peak_azi),
-            'peak_value': float(peak_value),
-            'region_mask': region_mask,
-            'region_size': int(region_size),
-            'threshold': float(peak_value - lambda_hat),
-            'lambda_used': float(lambda_hat)
+        gt_angles = [(float(gt_angles_all[0, i]), float(gt_angles_all[1, i])) for i in active_idx]
+        n_gt_used += len(gt_angles)
+
+        # match peaks to GT in degrees (validated peaks only)
+        matched = match_peaks_to_gt_degrees(
+            pred_peaks=peaks,
+            gt_angles_deg=gt_angles,
+            nele=nele,
+            nazi=nazi,
+            ae_TH_deg=ae_TH_deg,
+            use_elevation=use_elevation_in_cost
+        )
+
+        # optional Voronoi masks
+        voronoi_masks = None
+        if prevent_overlap and len(peaks) > 1:
+            voronoi_masks = create_voronoi_masks(peaks, (nele, nazi))
+
+        # compute lambda_star per matched GT
+        for gi, pj in enumerate(matched):
+            if pj is None:
+                continue  # A) only validated/matched peaks enter calibration (miss handling later)
+            n_matched += 1
+
+            gt_el, gt_az = gt_angles[gi]
+            ge, ga = angles_to_idx(gt_el, gt_az, nele, nazi)
+
+            peak_idx = peaks[int(pj)]
+            vm = None
+            if voronoi_masks is not None and int(pj) < len(voronoi_masks):
+                vm = voronoi_masks[int(pj)]
+
+            lam_star = _lambda_star_for_one_gt(
+                S_norm=S_norm,
+                peak_idx=peak_idx,
+                gt_idx=(ge, ga),
+                lambda_grid=lambda_grid,
+                connectivity=connectivity,
+                voronoi_mask=vm
+            )
+            lambda_stars.append(float(lam_star))
+
+    lambda_stars_arr = np.asarray(lambda_stars, dtype=np.float64)
+
+    if lambda_stars_arr.size == 0:
+        # no matched samples -> cannot calibrate
+        return {
+            "lambda_hat": 0.0,
+            "lambda_stars": lambda_stars_arr,
+            "n_frames": n_frames,
+            "n_gt_used": n_gt_used,
+            "n_matched": n_matched,
+            "alpha": float(alpha),
+            "note": "No matched GT-peaks in calibration; returning 0.0"
         }
 
-        # 4) Convert to degrees if doa_candidate provided
-        if doa_candidate is not None and len(doa_candidate) == 2:
-            ele_candidate, azi_candidate = doa_candidate
+    # Finite-sample conformal quantile in LOWER tail (alpha-quantile)
+    # lambda_hat = sort(lambda_star)[ceil((n+1)*alpha)-1]
+    n = int(lambda_stars_arr.size)
+    idx = int(np.ceil((n + 1) * float(alpha)) - 1)
+    idx = max(0, min(idx, n - 1))
 
-            # Convert indices to degrees
-            if 0 <= peak_ele < len(ele_candidate) and 0 <= peak_azi < len(azi_candidate):
-                ele_deg = float(np.degrees(ele_candidate[peak_ele]))
-                azi_deg = float(np.degrees(azi_candidate[peak_azi]))
-                region_info['peak_position_deg'] = (ele_deg, azi_deg)
-            else:
-                print(f"Warning: Peak position {(peak_ele, peak_azi)} outside doa_candidate bounds")
-                region_info['peak_position_deg'] = None
-        else:
-            region_info['peak_position_deg'] = None
+    srt = np.sort(lambda_stars_arr)
+    lambda_hat = float(srt[idx])
 
-        # 5) Compute improved region statistics
-        if region_size > 1:
-            region_coords = np.where(region_mask)
-            region_info['region_bounds'] = {
-                'ele_min': int(np.min(region_coords[0])),
-                'ele_max': int(np.max(region_coords[0])),
-                'azi_min': int(np.min(region_coords[1])),
-                'azi_max': int(np.max(region_coords[1]))
+    # sanity: empirical coverage on matched set:
+    # GT in region(lambda_hat) <=> lambda_star >= lambda_hat
+    emp_cov = float(np.mean(lambda_stars_arr >= lambda_hat) * 100.0)
+    target_cov = float((1.0 - float(alpha)) * 100.0)
+
+    out: Dict[str, Any] = {
+        "lambda_hat": lambda_hat,
+        "lambda_stars": lambda_stars_arr,
+        "n_frames": n_frames,
+        "n_gt_used": n_gt_used,
+        "n_matched": n_matched,
+        "alpha": float(alpha),
+        "empirical_coverage_matched_percent": emp_cov,
+        "target_coverage_percent": target_cov,
+        "quantile_index": idx,
+    }
+
+    # optional coverage curve (cheap, no BFS: use lambda_star thresholding)
+    # coverage(lambda) = P(lambda_star >= lambda)
+    cov_curve = np.array([np.mean(lambda_stars_arr >= lam) for lam in lambda_grid], dtype=np.float32)
+    out["coverage_curve"] = {
+        "lambda_grid": lambda_grid,
+        "coverage": cov_curve
+    }
+
+    if plot_calibration and MATPLOTLIB_AVAILABLE:
+        plt.figure(figsize=(10, 5))
+        plt.hist(lambda_stars_arr, bins=40, alpha=0.8, edgecolor='black', density=True)
+        plt.axvline(lambda_hat, linestyle="--", linewidth=2)
+        plt.xlabel("lambda_star (largest λ with GT inside)")
+        plt.ylabel("density")
+        plt.title(f"Waterfill calibration: alpha={alpha}  |  lambda_hat={lambda_hat:.3f}\n"
+                  f"matched={n_matched}  empirical cov≈{emp_cov:.1f}% (target {target_cov:.1f}%)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(lambda_grid, cov_curve)
+        plt.axhline(1.0 - float(alpha), linestyle="--")
+        plt.axvline(lambda_hat, linestyle="--")
+        plt.xlabel("lambda (absolute threshold on S_norm)")
+        plt.ylabel("coverage on matched set")
+        plt.title("Coverage curve (matched GT only)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    return out
+
+
+# ============================================================
+# Test-time region extraction (UPDATED to absolute-threshold lambda on S_norm)
+# ============================================================
+
+def extract_regions_test(
+    S: np.ndarray,
+    lambda_hat: float,
+    connectivity: int = 8,
+    prevent_overlap: bool = True,
+    suppress_radius: Tuple[int, int] = (3, 3),
+    return_normalized: bool = False
+) -> Dict[str, Any]:
+    """
+    Extract CP regions at test time.
+
+    Returns dict:
+      {
+        'S_norm': (nele,nazi) optional,
+        'peaks': [(pe,pa),...],
+        'regions': [ region_info, ... ],
+        'lambda_used': lambda_hat
+      }
+
+    Region definition:
+      region = connected component containing peak within { S_norm >= lambda_hat }
+      (optionally restricted to Voronoi cell)
+    """
+    S = np.asarray(S)
+    nele, nazi = S.shape
+    S_norm = normalize_map(S)
+
+    peaks = find_top2_peaks(S_norm, suppress_radius=suppress_radius)
+    if len(peaks) == 0:
+        return {"peaks": [], "regions": [], "lambda_used": float(lambda_hat), "note": "no peaks"}
+
+    voronoi_masks = None
+    if prevent_overlap and len(peaks) > 1:
+        voronoi_masks = create_voronoi_masks(peaks, (nele, nazi))
+
+    regions: List[Dict[str, Any]] = []
+    lambda_hat = float(np.clip(lambda_hat, 0.0, 1.0))
+
+    # grids for visualization / bounds conversion
+    ele_grid = np.linspace(0.0, 180.0, nele, endpoint=True)
+    azi_grid = np.linspace(-180.0, 180.0, nazi, endpoint=False)
+
+    for j, peak in enumerate(peaks):
+        vm = voronoi_masks[j] if voronoi_masks is not None else None
+        region_mask = flood_fill_region_threshold(S_norm, peak, lambda_hat, connectivity, vm)
+        region_size = int(np.sum(region_mask))
+
+        pe, pa = peak
+        peak_value = float(S_norm[pe, pa])
+
+        info: Dict[str, Any] = {
+            "peak_position_idx": (int(pe), int(pa)),
+            "peak_position_deg": idx_to_angles(int(pe), int(pa), nele, nazi),
+            "peak_value": peak_value,          # normalized peak value
+            "lambda_used": lambda_hat,         # absolute threshold
+            "threshold": lambda_hat,           # same as lambda_used (clarity)
+            "region_mask": region_mask,
+            "region_size": region_size,
+        }
+
+        if region_size > 0:
+            coords = np.where(region_mask)
+            info["region_bounds"] = {
+                "ele_min": int(np.min(coords[0])),
+                "ele_max": int(np.max(coords[0])),
+                "azi_min": int(np.min(coords[1])),
+                "azi_max": int(np.max(coords[1])),
             }
 
-            # Compute weighted centroid using spectrum values above threshold
-            threshold = peak_value - lambda_hat
-            weights = np.maximum(S - threshold, 0.0) * region_mask
+            # weighted centroid (circular mean in azimuth index)
+            weights = np.maximum(S_norm - lambda_hat, 0.0) * region_mask
+            if float(np.sum(weights)) > 0.0:
+                w = weights[coords]
+                ele_w = float(np.sum(coords[0] * w) / np.sum(w))
 
-            if np.sum(weights) > 0:
-                # Weighted centroid for elevation (no wraparound)
-                weighted_ele = np.sum(region_coords[0] * weights[region_coords]) / np.sum(weights[region_coords])
+                azi_idx = coords[1].astype(np.float64)
+                azi_w = w.astype(np.float64)
 
-                # Weighted circular mean for azimuth (considering wraparound)
-                azi_coords = region_coords[1]
-                azi_weights = weights[region_coords]
+                azi_angles = 2 * np.pi * azi_idx / float(nazi)
+                cplx = np.exp(1j * azi_angles)
+                mean_cplx = np.sum(cplx * azi_w) / (np.sum(azi_w) + 1e-12)
+                mean_angle = np.angle(mean_cplx)
+                azi_w_idx = float((mean_angle * float(nazi) / (2 * np.pi)) % float(nazi))
 
-                # Convert to complex numbers for circular mean
-                azi_angles = 2 * np.pi * azi_coords / nazi
-                complex_azi = np.exp(1j * azi_angles)
-                weighted_complex = np.sum(complex_azi * azi_weights) / np.sum(azi_weights)
-                mean_angle = np.angle(weighted_complex)
-
-                # Convert back to azimuth index
-                weighted_azi = (mean_angle * nazi / (2 * np.pi)) % nazi
-
-                region_info['weighted_centroid'] = (float(weighted_ele), float(weighted_azi))
+                info["weighted_centroid"] = (ele_w, azi_w_idx)
+                # also centroid in degrees for convenience
+                ce = int(np.clip(round(ele_w), 0, nele - 1))
+                ca = int(np.clip(round(azi_w_idx), 0, nazi - 1))
+                info["weighted_centroid_deg"] = (float(ele_grid[ce]), float(azi_grid[ca]))
             else:
-                # Fallback to simple mean if no weights
-                region_info['weighted_centroid'] = (
-                    float(np.mean(region_coords[0])),
-                    float(np.mean(region_coords[1]))
-                )
+                # fallback to mean indices
+                info["weighted_centroid"] = (float(np.mean(coords[0])), float(np.mean(coords[1])))
         else:
-            region_info['region_bounds'] = {
-                'ele_min': peak_ele, 'ele_max': peak_ele,
-                'azi_min': peak_azi, 'azi_max': peak_azi
-            }
-            region_info['weighted_centroid'] = (float(peak_ele), float(peak_azi))
+            info["region_bounds"] = {"ele_min": int(pe), "ele_max": int(pe), "azi_min": int(pa), "azi_max": int(pa)}
+            info["weighted_centroid"] = (float(pe), float(pa))
 
-        regions.append(region_info)
+        regions.append(info)
 
-        print(f"Region {peak_idx}: Peak@{(peak_ele, peak_azi)} (value={peak_value:.3f}), "
-              f"threshold={region_info['threshold']:.3f}, size={region_size} pixels")
+    out: Dict[str, Any] = {
+        "peaks": peaks,
+        "regions": regions,
+        "lambda_used": lambda_hat,
+    }
+    if return_normalized:
+        out["S_norm"] = S_norm
+    return out
 
-    print(f"Extracted {len(regions)} confidence regions using lambda_hat={lambda_hat:.3f}")
 
-    return regions
+# ============================================================
+# Visualization stub (optional)
+# ============================================================
 
-
-def angular_distance(pos1: np.ndarray, pos2: np.ndarray) -> float:
+def visualize_regions(
+    S: np.ndarray,
+    regions_out: Dict[str, Any],
+    gt_angles_deg: Optional[List[Tuple[float, float]]] = None,
+    save_path: Optional[str] = None
+) -> None:
     """
-    Compute angular distance between two DOA positions.
-
-    Args:
-        pos1, pos2: DOA positions as [elevation, azimuth] in degrees
-
-    Returns:
-        Angular distance in degrees
+    Simple visualization helper (optional).
+    - Draw S_norm heatmap
+    - Plot peaks and rectangle bounds of regions
     """
-    # TODO: Implement proper spherical distance calculation
-    # - Handle azimuth wraparound (-180 to +180 degrees)
-    # - Use spherical trigonometry for accurate distance
-    pass
+    if not MATPLOTLIB_AVAILABLE:
+        return
+
+    S = np.asarray(S)
+    nele, nazi = S.shape
+    S_norm = normalize_map(S)
+
+    ele_grid = np.linspace(0.0, 180.0, nele, endpoint=True)
+    azi_grid = np.linspace(-180.0, 180.0, nazi, endpoint=False)
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(S_norm, origin="lower", aspect="auto", extent=[azi_grid[0], azi_grid[-1], ele_grid[0], ele_grid[-1]])
+    plt.colorbar(label="S_norm")
+
+    peaks = regions_out.get("peaks", [])
+    for i, (pe, pa) in enumerate(peaks):
+        el, az = idx_to_angles(pe, pa, nele, nazi)
+        plt.scatter(az, el, marker="o", s=70, facecolors="none", edgecolors="cyan", linewidths=2,
+                    label="peaks" if i == 0 else None)
+
+    for i, reg in enumerate(regions_out.get("regions", [])):
+        b = reg.get("region_bounds", None)
+        if b is None:
+            continue
+        ele_min = ele_grid[b["ele_min"]]
+        ele_max = ele_grid[b["ele_max"]]
+        azi_min = azi_grid[b["azi_min"]]
+        azi_max = azi_grid[b["azi_max"]]
+        rect_azi = [azi_min, azi_max, azi_max, azi_min, azi_min]
+        rect_ele = [ele_min, ele_min, ele_max, ele_max, ele_min]
+        plt.plot(rect_azi, rect_ele, linewidth=2, label=f"region{i+1}")
+
+    if gt_angles_deg is not None:
+        for i, (el, az) in enumerate(gt_angles_deg):
+            az = ((az + 180.0) % 360.0) - 180.0
+            el = float(np.clip(el, 0.0, 180.0))
+            plt.scatter(az, el, marker="x", s=90, linewidths=2.5, c="red",
+                        label="GT" if i == 0 else None)
+
+    plt.xlabel("Azimuth [deg]")
+    plt.ylabel("Elevation [deg]")
+    plt.title(f"Regions (lambda={regions_out.get('lambda_used', None)})")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+    else:
+        plt.show()
 
 
-def visualize_regions(S: np.ndarray,
-                     regions: List[Dict],
-                     gt_positions: Optional[np.ndarray] = None,
-                     save_path: Optional[str] = None) -> None:
-    """
-    Visualize spatial spectrum with confidence regions and ground truth.
-
-    Args:
-        S: Spatial spectrum of shape (nele, nazi)
-        regions: List of region dictionaries from extract_regions_test
-        gt_positions: Optional GT positions for comparison
-        save_path: Optional path to save the plot
-    """
-    # TODO: Implement visualization
-    # - Plot spatial spectrum as heatmap
-    # - Overlay confidence regions as contours/masks
-    # - Mark peak positions and ground truth
-    # - Add colorbar and proper labeling
-    pass
-
+# ============================================================
+# Self-test
+# ============================================================
 
 if __name__ == "__main__":
+    print("=== CRC Pipeline Self-Test (Waterfill calibration) ===")
+
+    nele, nazi = 37, 73
+    rng = np.random.default_rng(0)
+
+    # create a toy spectrum with two blobs
+    S = rng.normal(0.0, 0.03, (nele, nazi)).astype(np.float32)
+
+    blob1_idx = (10, 12)
+    blob2_idx = (25, 50)
+
+    for e in range(nele):
+        for a in range(nazi):
+            d1 = np.sqrt((e - blob1_idx[0])**2 + (a - blob1_idx[1])**2)
+            d2 = np.sqrt((e - blob2_idx[0])**2 + (a - blob2_idx[1])**2)
+            S[e, a] += 1.0 * np.exp(-(d1**2) / 10.0)
+            S[e, a] += 0.7 * np.exp(-(d2**2) / 12.0)
+
+    # GT in degrees (close to blobs)
+    gt1_deg = idx_to_angles(blob1_idx[0], blob1_idx[1], nele, nazi)
+    gt2_deg = idx_to_angles(blob2_idx[0], blob2_idx[1], nele, nazi)
+
+    # build calibration list
+    spectra_cal = [S.copy() for _ in range(20)]
+    doa_gt_deg_cal = [np.array([[gt1_deg[0], gt2_deg[0]], [gt1_deg[1], gt2_deg[1]]], dtype=np.float32) for _ in range(20)]
+    vad_gt_cal = [np.array([1, 1], dtype=np.float32) for _ in range(20)]
+
+    cal = calibrate_lambda_waterfill(
+        spectra_cal=spectra_cal,
+        doa_gt_deg_cal=doa_gt_deg_cal,
+        vad_gt_cal=vad_gt_cal,
+        alpha=0.1,
+        ae_TH_deg=30.0,
+        prevent_overlap=True,
+        connectivity=8,
+        plot_calibration=False
+    )
+
+    print("Calibration output keys:", list(cal.keys()))
+    print("lambda_hat:", cal["lambda_hat"])
+    print("matched:", cal["n_matched"], "emp_cov_matched%:", cal["empirical_coverage_matched_percent"])
+
+    # test extraction
+    out = extract_regions_test(S, lambda_hat=cal["lambda_hat"], return_normalized=False)
+    print("test peaks:", out["peaks"])
+    print("region sizes:", [r["region_size"] for r in out["regions"]])
+
+    if MATPLOTLIB_AVAILABLE:
+        visualize_regions(S, out, gt_angles_deg=[gt1_deg, gt2_deg], save_path=None)
+def flood_fill_region_threshold(S: np.ndarray,
+                                peak_idx: Tuple[int, int],
+                                lambda_thr: float,
+                                connectivity: int = 8,
+                                voronoi_mask: Optional[np.ndarray] = None) -> np.ndarray:
     """
-    Simple self-test with fake spatial spectrum containing two bright blobs.
+    NEW: region = connected component around peak in the set { S >= lambda_thr }.
+    S is assumed normalized to [0,1]. lambda_thr in [0,1].
     """
-    print("=== CRC Pipeline Self-Test ===")
+    nele, nazi = S.shape
+    pe, pa = peak_idx
+    if not (0 <= pe < nele and 0 <= pa < nazi):
+        raise ValueError("peak out of bounds")
 
-    # Create fake spatial spectrum with two bright blobs
-    nele, nazi = 20, 36  # 20 elevation bins, 36 azimuth bins
-    S = np.random.normal(0.1, 0.05, (nele, nazi))  # Background noise
+    # if peak itself is below threshold -> empty region (or singleton False)
+    if S[pe, pa] < lambda_thr:
+        region = np.zeros((nele, nazi), dtype=bool)
+        return region
 
-    # Add two bright blobs at known positions
-    blob1_pos = (5, 10)   # (ele_idx, azi_idx)
-    blob2_pos = (12, 25)
+    region_mask = np.zeros((nele, nazi), dtype=bool)
+    visited = np.zeros((nele, nazi), dtype=bool)
 
-    # Create Gaussian blobs
-    for ele in range(nele):
-        for azi in range(nazi):
-            # Blob 1
-            dist1 = np.sqrt((ele - blob1_pos[0])**2 + (azi - blob1_pos[1])**2)
-            S[ele, azi] += 0.8 * np.exp(-dist1**2 / 4.0)
+    from collections import deque
+    q = deque([(pe, pa)])
+    visited[pe, pa] = True
+    region_mask[pe, pa] = True
 
-            # Blob 2
-            dist2 = np.sqrt((ele - blob2_pos[0])**2 + (azi - blob2_pos[1])**2)
-            S[ele, azi] += 0.6 * np.exp(-dist2**2 / 4.0)
-
-    print(f"Created spatial spectrum of shape {S.shape}")
-    print(f"Expected peaks at {blob1_pos} and {blob2_pos}")
-
-    # Test peak detection
-    peaks = find_top2_peaks(S, suppress_radius=(3, 3))
-    print(f"Found peaks: {peaks}")
-
-    # Verify peaks are correct
-    if len(peaks) == 2:
-        peak1, peak2 = peaks
-        # Check if peaks are close to expected positions
-        dist1_to_blob1 = np.sqrt((peak1[0] - blob1_pos[0])**2 + (peak1[1] - blob1_pos[1])**2)
-        dist1_to_blob2 = np.sqrt((peak1[0] - blob2_pos[0])**2 + (peak1[1] - blob2_pos[1])**2)
-
-        if dist1_to_blob1 <= dist1_to_blob2:
-            # peak1 matches blob1
-            expected_match = [(blob1_pos, peak1), (blob2_pos, peak2)]
-        else:
-            # peak1 matches blob2
-            expected_match = [(blob2_pos, peak1), (blob1_pos, peak2)]
-
-        print("Peak detection: ✓ PASSED")
-        for i, (expected, found) in enumerate(expected_match):
-            dist = np.sqrt((found[0] - expected[0])**2 + (found[1] - expected[1])**2)
-            print(f"  Peak {i+1}: expected {expected}, found {found}, distance={dist:.2f}")
+    if connectivity == 4:
+        neigh = [(-1,0),(1,0),(0,-1),(0,1)]
     else:
-        print(f"Peak detection: ✗ FAILED - Expected 2 peaks, found {len(peaks)}")
+        neigh = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
 
-    # Test matching
-    gt_positions = [blob1_pos, blob2_pos]  # Ground truth as (ele_idx, azi_idx)
-    matched_gt_indices = match_peaks_to_gt(peaks, gt_positions)
-    print(f"Matching result: {matched_gt_indices}")
+    while q:
+        ce, ca = q.popleft()
+        for de, da in neigh:
+            ne = ce + de
+            na = (ca + da) % nazi
+            if not (0 <= ne < nele):
+                continue
+            if visited[ne, na]:
+                continue
+            if voronoi_mask is not None and not voronoi_mask[ne, na]:
+                continue
+            visited[ne, na] = True
+            if S[ne, na] >= lambda_thr:
+                region_mask[ne, na] = True
+                q.append((ne, na))
 
-    # Verify matching
-    if len(peaks) == 2 and len(matched_gt_indices) == 2:
-        # Check if matching makes sense
-        total_error = 0
-        for gt_idx, pred_idx in enumerate(matched_gt_indices):
-            if pred_idx is not None:
-                gt_pos = gt_positions[gt_idx]
-                pred_pos = peaks[pred_idx]
-                error = np.sqrt((pred_pos[0] - gt_pos[0])**2 + (pred_pos[1] - gt_pos[1])**2)
-                total_error += error
-                print(f"  GT{gt_idx} {gt_pos} -> Pred{pred_idx} {pred_pos}, error={error:.2f}")
-
-        print(f"Matching: ✓ PASSED (total error={total_error:.2f})")
-    else:
-        print("Matching: ✗ FAILED - Incorrect number of matches")
-
-    print("=== Peak Detection and Matching Test Complete ===\n")
-
-    # =========================================================================
-    # Test flood-fill region
-    # =========================================================================
-    print("=== Flood-Fill Region Test ===")
-
-    # Create a simple 2D spectrum with a peak and smooth decay
-    nele, nazi = 15, 20
-    center_ele, center_azi = 7, 10
-    S_flood = np.zeros((nele, nazi))
-
-    # Create smooth decay from center peak
-    peak_value = 1.0
-    for ele in range(nele):
-        for azi in range(nazi):
-            # Distance from center with azimuth wraparound consideration
-            ele_dist = abs(ele - center_ele)
-            azi_dist = min(abs(azi - center_azi), nazi - abs(azi - center_azi))
-            total_dist = np.sqrt(ele_dist**2 + azi_dist**2)
-
-            # Smooth exponential decay
-            S_flood[ele, azi] = peak_value * np.exp(-total_dist**2 / 8.0)
-
-    print(f"Created spectrum with peak at {(center_ele, center_azi)} with value {S_flood[center_ele, center_azi]:.3f}")
-
-    # Test different lambda values
-    lambda_values = [0.0, 0.2, 0.5, 0.8]
-
-    for lambda_val in lambda_values:
-        region_mask = flood_fill_region(S_flood, (center_ele, center_azi), lambda_val)
-        region_size = np.sum(region_mask)
-        threshold = peak_value - lambda_val
-
-        print(f"Lambda={lambda_val:.1f}, Threshold={threshold:.3f}, Region size={region_size} pixels")
-
-        # Verify peak is always included
-        assert region_mask[center_ele, center_azi], f"Peak not included for lambda={lambda_val}"
-
-        # Show some region boundary info
-        if region_size > 1:
-            region_coords = np.where(region_mask)
-            min_ele, max_ele = np.min(region_coords[0]), np.max(region_coords[0])
-            min_azi, max_azi = np.min(region_coords[1]), np.max(region_coords[1])
-            print(f"  Region spans: ele=[{min_ele}, {max_ele}], azi=[{min_azi}, {max_azi}]")
-
-    # Verify region grows as lambda increases
-    regions_sizes = []
-    for lambda_val in lambda_values:
-        region_mask = flood_fill_region(S_flood, (center_ele, center_azi), lambda_val)
-        regions_sizes.append(np.sum(region_mask))
-
-    # Check that regions are monotonically increasing
-    is_increasing = all(regions_sizes[i] <= regions_sizes[i+1] for i in range(len(regions_sizes)-1))
-
-    if is_increasing:
-        print("✓ PASSED: Region size increases with lambda as expected")
-    else:
-        print(f"✗ FAILED: Region sizes not increasing: {regions_sizes}")
-
-    # Test edge case: lambda = 0 should only include peak
-    region_mask_zero = flood_fill_region(S_flood, (center_ele, center_azi), 0.0)
-    if np.sum(region_mask_zero) == 1 and region_mask_zero[center_ele, center_azi]:
-        print("✓ PASSED: Lambda=0 includes only peak")
-    else:
-        print(f"✗ FAILED: Lambda=0 should include only peak, got {np.sum(region_mask_zero)} pixels")
-
-    # Test connectivity options
-    region_4conn = flood_fill_region(S_flood, (center_ele, center_azi), 0.3, connectivity=4)
-    region_8conn = flood_fill_region(S_flood, (center_ele, center_azi), 0.3, connectivity=8)
-
-    size_4 = np.sum(region_4conn)
-    size_8 = np.sum(region_8conn)
-
-    if size_8 >= size_4:
-        print(f"✓ PASSED: 8-connectivity ({size_8}) >= 4-connectivity ({size_4})")
-    else:
-        print(f"✗ FAILED: 8-connectivity should be >= 4-connectivity")
-
-    print("=== Flood-Fill Test Complete ===\n")
-
-    # =========================================================================
-    # Test conformal prediction calibration
-    # =========================================================================
-    print("=== Conformal Prediction Calibration Test ===")
-
-    # Create synthetic calibration data with multiple frames
-    np.random.seed(42)  # For reproducible results
-    n_cal_frames = 50
-    nele, nazi = 15, 20
-
-    spectra_cal = []
-    gt_cal = []
-
-    print(f"Creating {n_cal_frames} synthetic calibration frames...")
-
-    for frame_idx in range(n_cal_frames):
-        # Create base spectrum with noise
-        spectrum = np.random.normal(0.1, 0.05, (nele, nazi))
-
-        # Add 2 speakers at random positions
-        speakers = []
-        for spk_idx in range(2):
-            # Random speaker position
-            gt_ele = np.random.randint(2, nele-2)
-            gt_azi = np.random.randint(2, nazi-2)
-            speakers.append((gt_ele, gt_azi))
-
-            # Add speaker as Gaussian blob with some randomness
-            peak_strength = 0.6 + 0.4 * np.random.random()  # Random strength
-            for ele in range(nele):
-                for azi in range(nazi):
-                    dist = np.sqrt((ele - gt_ele)**2 + (azi - gt_azi)**2)
-                    spectrum[ele, azi] += peak_strength * np.exp(-dist**2 / 6.0)
-
-        spectra_cal.append(spectrum)
-        gt_cal.append(speakers)
-
-    print(f"Created calibration data: {len(spectra_cal)} frames with {sum(len(gt) for gt in gt_cal)} total speakers")
-
-    # Test conformal prediction with different alpha values
-    alpha_values = [0.05, 0.1, 0.2]
-
-    for alpha in alpha_values:
-        print(f"\n--- Testing alpha = {alpha} (target coverage = {(1-alpha)*100:.0f}%) ---")
-        # Enable plotting for the first alpha value to demonstrate calibration visualization
-        plot_calibration = (alpha == alpha_values[0])
-        lambda_hat, deltas = compute_lambda_cp(spectra_cal, gt_cal, alpha, plot_calibration=plot_calibration)
-
-        if len(deltas) > 0:
-            # Basic statistics
-            print(f"Statistics: mean={np.mean(deltas):.3f}, std={np.std(deltas):.3f}, "
-                  f"median={np.median(deltas):.3f}")
-
-            # Verify lambda_hat is reasonable
-            coverage_estimate = np.mean(deltas <= lambda_hat)
-            print(f"Empirical coverage with lambda_hat: {coverage_estimate*100:.1f}%")
-
-            if coverage_estimate >= (1 - alpha) - 0.05:  # Allow small tolerance
-                print("✓ PASSED: Coverage meets target")
-            else:
-                print(f"✗ WARNING: Coverage {coverage_estimate*100:.1f}% < target {(1-alpha)*100:.0f}%")
-
-    # Test edge cases
-    print("\n--- Testing edge cases ---")
-
-    # Empty calibration data
-    try:
-        lambda_empty, deltas_empty = compute_lambda_cp([], [], 0.1)
-        if len(deltas_empty) == 0:
-            print("✓ PASSED: Empty data handled correctly")
-        else:
-            print("✗ FAILED: Empty data not handled correctly")
-    except Exception as e:
-        print(f"✗ FAILED: Exception with empty data: {e}")
-
-    # Single frame
-    single_spectrum = [spectra_cal[0]]
-    single_gt = [gt_cal[0]]
-    lambda_single, deltas_single = compute_lambda_cp(single_spectrum, single_gt, 0.1)
-    if len(deltas_single) > 0:
-        print(f"✓ PASSED: Single frame handled (lambda={lambda_single:.3f})")
-    else:
-        print("✗ FAILED: Single frame not handled correctly")
-
-    print("=== Conformal Prediction Test Complete ===\n")
-
-    # =========================================================================
-    # Test complete conformal prediction pipeline (calibration + test)
-    # =========================================================================
-    print("=== Complete Conformal Prediction Pipeline Test ===")
-
-    # Use calibrated lambda from previous test
-    lambda_hat_90 = compute_lambda_cp(spectra_cal, gt_cal, alpha=0.1)[0]
-    print(f"Using calibrated lambda_hat = {lambda_hat_90:.3f} for 90% coverage\n")
-
-    # Create test data (different from calibration)
-    print("Creating test spectrum...")
-    nele, nazi = 15, 20
-    test_spectrum = np.random.normal(0.1, 0.05, (nele, nazi))
-
-    # Add 2 test speakers at known positions
-    test_speaker1 = (6, 8)
-    test_speaker2 = (11, 15)
-
-    # Create test blobs
-    for ele in range(nele):
-        for azi in range(nazi):
-            # Speaker 1
-            dist1 = np.sqrt((ele - test_speaker1[0])**2 + (azi - test_speaker1[1])**2)
-            test_spectrum[ele, azi] += 0.7 * np.exp(-dist1**2 / 5.0)
-
-            # Speaker 2
-            dist2 = np.sqrt((ele - test_speaker2[0])**2 + (azi - test_speaker2[1])**2)
-            test_spectrum[ele, azi] += 0.9 * np.exp(-dist2**2 / 5.0)
-
-    print(f"Test speakers at: {test_speaker1} and {test_speaker2}")
-
-    # Extract confidence regions using learned lambda
-    regions = extract_regions_test(test_spectrum, lambda_hat_90)
-
-    print(f"\n--- Test Results ---")
-    print(f"Number of regions extracted: {len(regions)}")
-
-    for i, region in enumerate(regions):
-        print(f"\nRegion {i}:")
-        print(f"  Peak position: {region['peak_position_idx']}")
-        print(f"  Peak value: {region['peak_value']:.3f}")
-        print(f"  Threshold: {region['threshold']:.3f}")
-        print(f"  Region size: {region['region_size']} pixels")
-        print(f"  Region bounds: {region['region_bounds']}")
-        print(f"  Region centroid: ({region['weighted_centroid'][0]:.1f}, {region['weighted_centroid'][1]:.1f})")
-
-    # Verify regions contain ground truth speakers
-    coverage_check = []
-    for speaker_idx, gt_speaker in enumerate([test_speaker1, test_speaker2]):
-        contained_in_regions = []
-
-        for region_idx, region in enumerate(regions):
-            mask = region['region_mask']
-            gt_ele, gt_azi = gt_speaker
-
-            if mask[gt_ele, gt_azi]:
-                contained_in_regions.append(region_idx)
-
-        coverage_check.append(len(contained_in_regions) > 0)
-        print(f"Speaker {speaker_idx} at {gt_speaker}: {'✓ COVERED' if len(contained_in_regions) > 0 else '✗ NOT COVERED'} "
-              f"by regions {contained_in_regions}")
-
-    overall_coverage = np.mean(coverage_check) * 100
-    print(f"\nOverall test coverage: {overall_coverage:.0f}% ({sum(coverage_check)}/{len(coverage_check)} speakers)")
-
-    # Test with DOA candidate conversion
-    print(f"\n--- Testing with DOA candidate conversion ---")
-    ele_candidate = np.linspace(0, np.pi, nele)  # 0 to 180 degrees
-    azi_candidate = np.linspace(-np.pi, np.pi, nazi)  # -180 to 180 degrees
-    doa_candidate = [ele_candidate, azi_candidate]
-
-    regions_with_doa = extract_regions_test(test_spectrum, lambda_hat_90, doa_candidate=doa_candidate)
-
-    for i, region in enumerate(regions_with_doa):
-        if region['peak_position_deg'] is not None:
-            ele_deg, azi_deg = region['peak_position_deg']
-            print(f"Region {i}: Peak at ({ele_deg:.1f}°, {azi_deg:.1f}°)")
-        else:
-            print(f"Region {i}: DOA conversion failed")
-
-    # Test different lambda values on same test spectrum
-    print(f"\n--- Testing different lambda values ---")
-    test_lambdas = [0.0, 0.1, 0.2, 0.5]
-
-    for test_lambda in test_lambdas:
-        regions_lambda = extract_regions_test(test_spectrum, test_lambda)
-        total_region_size = sum(r['region_size'] for r in regions_lambda)
-        print(f"Lambda = {test_lambda:.1f}: {len(regions_lambda)} regions, total size = {total_region_size} pixels")
-
-    print("=== Complete Pipeline Test Complete ===")
+    return region_mask

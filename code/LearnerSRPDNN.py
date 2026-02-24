@@ -160,11 +160,14 @@ class SourceTrackingFromSTFTLearner(Learner):
 				pred_ipd_rebatch = deepcopy(ipd_pool_rebatch)
 				nt = deepcopy(nt_pool)
 			
-			pred_DOAs, pred_VADs, pred_ss = self.sourcelocalize(pred_ipd=pred_ipd_rebatch, dpipd_template=dpipd_template, doa_candidate=doa_candidate)
+			pred_DOAs, pred_VADs, pred_ss, iter_maps = self.sourcelocalize(pred_ipd=pred_ipd_rebatch, dpipd_template=dpipd_template, doa_candidate=doa_candidate)
 			pred_batch = {}
 			pred_batch['doa'] = pred_DOAs
 			pred_batch['vad_sources'] = pred_VADs
 			pred_batch['spatial_spectrum'] = pred_ss
+			if iter_maps is not None:
+				# iter_maps: (K, nb, nt, nele, nazi) float32 numpy - per-IDL-iteration spectra
+				pred_batch['iter_maps'] = iter_maps
 
 		if gt_batch is not None:
 			for key in gt_batch.keys():

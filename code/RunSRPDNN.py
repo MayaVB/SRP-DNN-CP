@@ -10,11 +10,16 @@ import os
 from OptSRPDNN import opt
 import matplotlib.pyplot as plt
 import numpy as np
+from crc_pipeline import calibrate_lambda_waterfill
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
 
 opts = opt()
 args = opts.parse()
 dirs = opts.dir()
- 
+
 os.environ["OMP_NUM_THREADS"] = str(8) # limit the threads to reduce cpu overloads, will speed up when there are lots of CPU cores on the running machine
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
@@ -35,7 +40,6 @@ import ModelSRPDNN as at_model
 import Module as at_module
 from Dataset import Parameter
 from utils import set_seed, set_random_seed, set_learning_rate
-from crc_pipeline import find_top2_peaks, match_peaks_to_gt
 
 if __name__ == "__main__":
 	use_cuda = not args.no_cuda and torch.cuda.is_available()
@@ -154,12 +158,12 @@ if __name__ == "__main__":
 			num_source = Parameter(args.sources, discrete=True), # Random number of sources
 			source_state = args.source_state,
 			room_sz = Parameter([3,3,2.5], [10,8,6]),  	# Random room sizes from 3x3x2.5 to 10x8x6 meters
-			T60 = Parameter(0.2, 1.3),					# Random reverberation times from 0.2 to 1.3 seconds
+			T60 = Parameter(0.6, ),					# Random reverberation times from 0.2 to 1.3 seconds
 			abs_weights = Parameter([0.5]*6, [1.0]*6),  # Random absorption weights ratios between walls
 			array_setup = array_setup,
 			array_pos = Parameter([0.1,0.1,0.1], [0.9,0.9,0.5]), # Ensure a minimum separation between the array and the walls
 			noiseDataset = noiseDataset_train,
-			SNR = Parameter(5, 30), 	
+			SNR = Parameter(20, ), 	
 			nb_points = traj_points,	
 			dataset_sz= 1000,
 			c = speed, 
@@ -170,12 +174,12 @@ if __name__ == "__main__":
 			num_source = Parameter(args.sources, discrete=True),  
 			source_state = args.source_state,
 			room_sz = Parameter([3,3,2.5], [10,8,6]),
-			T60 = Parameter(0.2, 1.3),
+			T60 = Parameter(0.6, ),
 			abs_weights = Parameter([0.5]*6, [1.0]*6),
 			array_setup = array_setup,
 			array_pos = Parameter([0.1,0.1,0.1], [0.9,0.9,0.5]),
 			noiseDataset = noiseDataset_val,
-			SNR = Parameter(5, 30),
+			SNR = Parameter(20, ), 	
 			nb_points = traj_points,
 			dataset_sz= 1000,
 			c = speed, 
@@ -248,8 +252,8 @@ if __name__ == "__main__":
 
 	if (args.cp_calibration): 
 		print("CP Calibration Stage!")
-		dataloader_cal = torch.utils.data.DataLoader(dataset_cal, batch_size=args.bs[1], shuffle=False, **kwargs)
-		# dataloader_cal = torch.utils.data.DataLoader(dataset_cal, batch_size=10, shuffle=False, **kwargs)
+		# dataloader_cal = torch.utils.data.DataLoader(dataset_cal, batch_size=args.bs[1], shuffle=False, **kwargs)
+		dataloader_cal = torch.utils.data.DataLoader(dataset_cal, batch_size=10, shuffle=False, **kwargs)
 
 		# Load trained model
 		learner.resume_checkpoint(checkpoints_dir=dirs['log'], from_latest=False)
@@ -310,161 +314,114 @@ if __name__ == "__main__":
 		print(f"  ss_pred: {ss_pred.shape}")
 		print(f"  doa_gt: {doa_gt.shape}")
 
-		deltas = []
+		# ---------------------------
+		# Prepare calibration samples
+		# ---------------------------
+		# ss_pred: (nb, nt, nele, nazi) numpy
+		# doa_gt : (nb, nt, 2, ns) torch radians
+		# vad_gt : (nb, nt, ns) numpy (or torch -> convert)
 
-		print(f"Processing {nb} batches with {nt} time frames each...")
+		# Convert GT DOA to degrees (per-frame list expects (2,ns))
+		doa_gt_deg_all = (doa_gt.detach().cpu().numpy() * 180.0 / np.pi)  # (nb,nt,2,ns)
 
-		# Use exact same evaluation logic as Module.py for calibration
-		metric_setting = {'ae_mode':['azi', 'ele'], 'ae_TH':30, 'useVAD':False, 'vad_TH':[2/3, 0.0]}
+		# Ensure vad_gt as numpy bool/float
+		vad_gt_all = np.asarray(vad_gt)  # (nb,nt,ns)
+
+		# Flatten to per-frame lists for crc_pipeline
+		spectra_cal = []
+		doa_gt_deg_cal = []
+		vad_gt_cal = []
 
 		for b in range(nb):
-			# Convert tensors for this batch
-			doa_gt_deg = doa_gt[b] * 180 / np.pi  # (nt, 2, ns) convert to degrees
-			doa_pred_deg = torch.from_numpy(doa_pred[b] * 180 / np.pi)  # (nt, 2, ns)
-			vad_gt_one = torch.from_numpy(vad_gt[b])  # (nt, ns)
-			vad_pred_one = torch.from_numpy(vad_pred[b])  # (nt, ns)
-
 			for t in range(nt):
-				# Apply same evaluation logic as Module.py lines 267-280
-				num_gt = int(vad_gt_one[t].sum().item()) if metric_setting['useVAD'] else doa_gt.shape[-1]
-				num_est = int(vad_pred_one[t].sum().item()) if metric_setting['useVAD'] else doa_pred.shape[-1]
+				spectra_cal.append(ss_pred[b, t])              # (nele,nazi)
+				doa_gt_deg_cal.append(doa_gt_deg_all[b, t])    # (2,ns)
+				vad_gt_cal.append(vad_gt_all[b, t])            # (ns,)
 
-				if num_gt > 0 and num_est > 0:
-					# Get active sources (same as Module.py)
-					if metric_setting['useVAD']:
-						est = doa_pred_deg[t, :, vad_pred_one[t] > metric_setting['vad_TH'][1]]
-						gt = doa_gt_deg[t, :, vad_gt_one[t] > metric_setting['vad_TH'][0]]
-					else:
-						est = doa_pred_deg[t, :, :]  # All sources
-						gt = doa_gt_deg[t, :, :]
+		alpha = float(args.cp_alpha)
 
-					# Build distance matrix (same as Module.py)
-					dist_mat_az = torch.zeros((num_gt, num_est))
-					for gt_idx in range(num_gt):
-						for est_idx in range(num_est):
-							# Angular distance calculation
-							az_diff = torch.abs((est[1, est_idx] - gt[1, gt_idx] + 180) % 360 - 180)
-							dist_mat_az[gt_idx, est_idx] = az_diff
+		# Hard scan grid (no efficiency tricks)
+		lambda_grid = np.linspace(0.0, 1.0, 1001, dtype=np.float32)
 
-					# Apply Hungarian algorithm with thresholds (same as Module.py)
-					invalid_assigns = dist_mat_az > metric_setting['ae_TH']
-					dist_mat_az_bak = dist_mat_az.clone()
-					dist_mat_az_bak[invalid_assigns] = 10000  # Large number
+		print("===================================================")
+		print("CP Calibration (WATERFILL THRESHOLD MODE)")
+		print(f"alpha={alpha} | target coverage={(1-alpha)*100:.1f}%")
+		print(f"Frames used for calibration: {len(spectra_cal)}")
+		print("===================================================")
 
-					from scipy.optimize import linear_sum_assignment
-					assignment = list(linear_sum_assignment(dist_mat_az_bak))
+		cal = calibrate_lambda_waterfill(
+			spectra_cal=spectra_cal,
+			doa_gt_deg_cal=doa_gt_deg_cal,
+			vad_gt_cal=vad_gt_cal,           # if you want GT-VAD gating; if not, pass None
+			alpha=alpha,
+			ae_TH_deg=30.0,
+			use_elevation_in_cost=False,     # keep consistent with your metric gate (azimuth only)
+			prevent_overlap=True,            # recommended so regions don’t bleed between peaks
+			connectivity=8,
+			suppress_radius=(3, 3),
+			lambda_grid=lambda_grid,
+			plot_calibration=False
+		)
 
-					# Judge assignment quality (same as Module.py)
-					final_assignment = torch.tensor([10 for i in range(dist_mat_az.shape[0])])  # invalid_idx = 10
-					for i in range(min(dist_mat_az.shape[0], dist_mat_az.shape[1])):
-						if dist_mat_az_bak[assignment[0][i], assignment[1][i]] != 10000:
-							final_assignment[assignment[0][i]] = assignment[1][i]
+		lambda_hat = float(cal["lambda_hat"])
+		lambda_stars = cal["lambda_stars"]
 
-					# Compute nonconformity scores for VALID assignments only
-					S = ss_pred[b, t]  # (nele, nazi)
-					for src_idx in range(num_gt):
-						if final_assignment[src_idx] != 10:  # Valid assignment
-							# Get validated peak location from assignment
-							if metric_setting['useVAD']:
-								est_indices = torch.where(vad_pred_one[t] > metric_setting['vad_TH'][1])[0]
-								est_peak_doa = doa_pred_deg[t, :, est_indices[final_assignment[src_idx]]].numpy()
-								gt_indices = torch.where(vad_gt_one[t] > metric_setting['vad_TH'][0])[0]
-								gt_doa = doa_gt_deg[t, :, gt_indices[src_idx]]
-							else:
-								est_peak_doa = doa_pred_deg[t, :, final_assignment[src_idx]].numpy()
-								gt_doa = doa_gt_deg[t, :, src_idx]
+		print(f"lambda_hat = {lambda_hat:.6f}")
+		print(f"matched samples = {cal['n_matched']} (out of GT used {cal['n_gt_used']})")
+		print(f"empirical coverage on matched = {cal['empirical_coverage_matched_percent']:.1f}% "
+			f"(target {cal['target_coverage_percent']:.1f}%)")
 
-							# Convert to grid indices
-							peak_ele_idx = int(round((est_peak_doa[0] / 180.0) * (nele - 1)))
-							peak_azi_idx = int(round(((est_peak_doa[1] + 180.0) / 360.0) * (nazi - 1)))
-							peak_ele_idx = np.clip(peak_ele_idx, 0, nele-1)
-							peak_azi_idx = np.clip(peak_azi_idx, 0, nazi-1)
+		# ---------------------------
+		# Save calibration outputs
+		# ---------------------------
+		cal_dir = os.path.join(dirs["log"], "calibration")
+		os.makedirs(cal_dir, exist_ok=True)
 
-							gt_ele_idx = int(round((gt_doa[0].item() / 180.0) * (nele - 1)))
-							gt_azi_idx = int(round(((gt_doa[1].item() + 180.0) / 360.0) * (nazi - 1)))
-							gt_ele_idx = np.clip(gt_ele_idx, 0, nele-1)
-							gt_azi_idx = np.clip(gt_azi_idx, 0, nazi-1)
+		lambda_path = os.path.join(cal_dir, f"lambda_alpha_{alpha}.npy")
+		np.save(lambda_path, np.array(lambda_hat, dtype=np.float32))
+		print(f"Saved lambda_hat to: {lambda_path}")
 
-							# Nonconformity score: spectrum difference
-							S_peak = S[peak_ele_idx, peak_azi_idx]
-							S_gt = S[gt_ele_idx, gt_azi_idx]
-							delta = max(0.0, S_peak - S_gt)
-							deltas.append(delta)
+		# also save lambda_star distribution (super useful)
+		stars_path = os.path.join(cal_dir, f"lambda_stars_alpha_{alpha}.npy")
+		np.save(stars_path, lambda_stars.astype(np.float32))
+		print(f"Saved lambda_stars to: {stars_path}")
 
-				# Debug info for first few frames
-				if b < 2 and t < 2:
-					print(f"  Batch {b}, Frame {t}: evaluation-based calibration, {len(deltas)} scores so far")
-
-		deltas = np.array(deltas)
-
-		if len(deltas) == 0:
-			print("ERROR: No valid nonconformity scores computed!")
-			print("This likely indicates peak detection or matching failures.")
-			exit(1)
-
-		alpha = args.cp_alpha
-		N = len(deltas)
-
-		# Finite-sample CP quantile
-		k = int(np.ceil((N + 1) * (1 - alpha))) - 1
-		lambda_hat = np.sort(deltas)[k]
-
-		print(f"Alpha: {alpha}")
-		print(f"Lambda_hat: {lambda_hat}")
-		print(f"Total calibration samples: {N}")
-
-		# Empirical coverage calculation
-		empirical_coverage = np.mean(deltas <= lambda_hat) * 100
-		target_coverage = (1 - alpha) * 100
-		print(f"Empirical coverage: {empirical_coverage:.1f}% (target: {target_coverage:.1f}%)")
-
-		# Additional statistics
-		print(f"Delta statistics: mean={np.mean(deltas):.3f}, std={np.std(deltas):.3f}, "
-			  f"median={np.median(deltas):.3f}")
-		print(f"Delta range: [{np.min(deltas):.3f}, {np.max(deltas):.3f}]")
-
-		# Save lambda
-		cal_dir = dirs['log'] + '/calibration'
-		if not os.path.exists(cal_dir):
-			os.makedirs(cal_dir)
-
-		lambda_path = cal_dir + f'/lambda_alpha_{alpha}.npy'
-		np.save(lambda_path, lambda_hat)
-		print(f"Saved lambda to {lambda_path}")
-
-		# Improved plot with empirical coverage
+		# ---------------------------
+		# Plots (replace delta plot)
+		# ---------------------------
+		# 1) histogram of lambda_star and lambda_hat
 		plt.figure(figsize=(10, 6))
-
-		# Histogram of nonconformity scores
-		plt.hist(deltas, bins=min(50, max(10, N//20)), alpha=0.7, color='skyblue',
-				 edgecolor='black', density=True, label='Nonconformity Scores')
-
-		# Mark lambda_hat with a vertical line
-		plt.axvline(lambda_hat, color='red', linestyle='--', linewidth=2,
-				   label=f'λ_hat = {lambda_hat:.3f}')
-
-		# Add text annotations
-		plt.xlabel('Nonconformity Score (δ = S_peak - S_GT)')
-		plt.ylabel('Density')
-		plt.title(f'CP Calibration: Nonconformity Score Distribution\n'
-				 f'α = {alpha} (Target Coverage: {target_coverage:.1f}%), '
-				 f'Empirical Coverage: {empirical_coverage:.1f}%')
-		plt.legend()
+		plt.hist(lambda_stars, bins=40, alpha=0.75, edgecolor="black", density=True)
+		plt.axvline(lambda_hat, color="red", linestyle="--", linewidth=2, label=f"λ_hat={lambda_hat:.3f}")
+		plt.xlabel("lambda_star (largest λ with GT inside region)")
+		plt.ylabel("Density")
+		plt.title(f"WATERFILL Calibration | α={alpha} | target cov={(1-alpha)*100:.1f}% "
+				f"| empirical={cal['empirical_coverage_matched_percent']:.1f}%")
 		plt.grid(True, alpha=0.3)
-
-		# Add statistics text box
-		stats_text = (f'N = {N} scores\n'
-					 f'Mean: {np.mean(deltas):.3f}\n'
-					 f'Std: {np.std(deltas):.3f}\n'
-					 f'Min: {np.min(deltas):.3f}\n'
-					 f'Max: {np.max(deltas):.3f}')
-		plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
-				verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
+		plt.legend()
 		plt.tight_layout()
-		plt.savefig(cal_dir + f'/delta_hist_alpha_{alpha}.png', dpi=150, bbox_inches='tight')
-		print(f"Saved calibration plot to: {cal_dir}/delta_hist_alpha_{alpha}.png")
+		plt.savefig(os.path.join(cal_dir, f"lambda_star_hist_alpha_{alpha}.png"), dpi=150, bbox_inches="tight")
 		plt.close()
+		print(f"Saved plot: {cal_dir}/lambda_star_hist_alpha_{alpha}.png")
+
+		# 2) coverage curve
+		cc = cal.get("coverage_curve", None)
+		if cc is not None:
+			lam_grid = cc["lambda_grid"]
+			cov = cc["coverage"]
+			plt.figure(figsize=(10, 5))
+			plt.plot(lam_grid, cov)
+			plt.axhline(1.0 - alpha, color="black", linestyle="--", linewidth=1.5, label="target cov")
+			plt.axvline(lambda_hat, color="red", linestyle="--", linewidth=2, label="λ_hat")
+			plt.xlabel("lambda (absolute threshold on normalized spectrum)")
+			plt.ylabel("coverage on matched set")
+			plt.title("Coverage curve (matched GT only)")
+			plt.grid(True, alpha=0.3)
+			plt.legend()
+			plt.tight_layout()
+			plt.savefig(os.path.join(cal_dir, f"coverage_curve_alpha_{alpha}.png"), dpi=150, bbox_inches="tight")
+			plt.close()
+			print(f"Saved plot: {cal_dir}/coverage_curve_alpha_{alpha}.png")
 
 		print("Calibration complete.")
 		exit(0)
@@ -562,7 +519,7 @@ if __name__ == "__main__":
 				
 			elif ins_mode == 'some':
 				T60 = np.array((0.4,))  # Reverberation times to analyze
-				SNR = np.array((5,))  	# SNRs to analyze
+				SNR = np.array((15,)) 	# SNRs to analyze  (→ Reverb_400_ms_SNR_15_dB)
 				dataset_test.dataset_sz = 10  # Make sure dataset has enough instances
 
 				# CONTROL WHICH INSTANCES TO PLOT - modify this list!
@@ -577,8 +534,128 @@ if __name__ == "__main__":
 					dataset_test.T60 = Parameter(T60[i])
 					dataset_test.SNR = Parameter(SNR[j])
 					set_random_seed(args.seed)
+					if getattr(args, "dump_npz", False) and args.dump_dir:
+						dataset_test.dataset_sz = 500  # NPZ export requires exactly 500 examples
 					dataloader_test = torch.utils.data.DataLoader(dataset=dataset_test, batch_size=args.bs[2], shuffle=False, **kwargs)
 					pred, gt, mic_sig = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=True)
+
+					# ── NPZ export (raw list-of-batches, before _concat_predgt) ───────────
+					if getattr(args, "dump_npz", False) and args.dump_dir:
+						K = int(args.localize_mode[2])
+						assert K == 2, (
+							f"[NPZ export] Expected K=2 speakers, got K={K}. "
+							f"Use --localize-mode IDL kNum 2 so iter_maps has exactly 2 iterations."
+						)
+						maps_list    = []
+						est_list     = []
+						gt_list      = []
+						metric_lists = {k: [] for k in range(K)}
+
+						for item_idx, (p, g) in enumerate(zip(pred, gt)):
+							# Sanity checks
+							im = p.get("iter_maps", None)
+							assert im is not None, \
+								"[NPZ export] iter_maps missing – ensure IDL mode is active"
+							assert im.shape[1] == 1, \
+								f"[NPZ export] Expected nb=1, got {im.shape[1]}. Run with batch_size=1."
+							assert im.shape[3] == res_the and im.shape[4] == res_phi, (
+								f"[NPZ export] Grid mismatch: expected ({res_the},{res_phi}), got {im.shape[3:]}"
+							)
+							assert im.shape[0] == K, (
+								f"[NPZ export] iter_maps has {im.shape[0]} iterations but K={K}. "
+								f"IDL loop must run exactly K times."
+							)
+							nt_gt = g["doa"].shape[1]   # =1 for static, may be >1 for mobile
+							assert g["doa"].shape[-1] == 2, (
+								f"[NPZ export] item {item_idx}: GT has {g['doa'].shape[-1]} source(s), "
+								f"expected 2. Run with --sources 2 2 to ensure every scene has exactly 2 speakers."
+							)
+
+							# nt→1 reduction: shared t* = argmax_t (peak0[t] + peak1[t])
+							# where peak_k[t] = max_{ele,azi}(map[k,0,t])
+							item_maps = np.zeros((K, res_the, res_phi), dtype=np.float32)
+							item_est  = np.zeros((K, 2), dtype=np.float64)
+							item_gt   = np.zeros((K, 2), dtype=np.float32)
+
+							peak_sum = sum(
+								np.max(im[k, 0], axis=(-2, -1)) for k in range(K)
+							)  # (nt,)
+							t_star = int(np.argmax(peak_sum))
+
+							for k in range(K):
+								item_maps[k] = im[k, 0, t_star, :, :]
+								item_est[k]  = p["doa"][0, t_star, :, k].cpu().numpy()              # [ele, azi]
+								item_gt[k]   = g["doa"][0, min(t_star, nt_gt - 1), :, k].cpu().numpy()  # clamp for static
+
+							maps_list.append(item_maps)
+							est_list.append(item_est)
+							gt_list.append(item_gt)
+
+							for k in range(K):
+								metric_lists[k].append(float(np.max(item_maps[k])))
+
+						# Stack into final arrays
+						all_likelihood_maps     = np.stack(maps_list, axis=0).astype(np.float32)  # (N, K, 37, 73)
+						all_estimated_positions = np.stack(est_list,  axis=0).astype(np.float64)  # (N, K, 2)
+						speaker_pos             = np.stack(gt_list,   axis=0).astype(np.float32)  # (N, K, 2)
+						N = len(maps_list)
+
+						# Shape asserts
+						assert N == 500, f"[NPZ export] Expected 500 items, got {N}"
+						assert all_likelihood_maps.shape     == (500, K, res_the, res_phi)
+						assert all_estimated_positions.shape == (500, K, 2)
+						assert speaker_pos.shape             == (500, K, 2)
+
+						# speaker_metrics: object dict {k: {"softmax_prob": list[N]}}
+						speaker_metrics = np.array(
+							{k: {"softmax_prob": metric_lists[k]} for k in range(K)},
+							dtype=object)
+
+						# rir_obj: 2-D grid definition (consistent with DPIPD.__init__)
+						ele_cand = np.linspace(0,      np.pi, res_the)
+						azi_cand = np.linspace(-np.pi, np.pi, res_phi)
+						AZI_grid, ELE_grid = np.meshgrid(azi_cand, ele_cand)
+						rir_obj = np.array({
+							"type":    "sphere",
+							"xl":      AZI_grid,
+							"yl":      ELE_grid,
+							"extent":  np.array([-np.pi, np.pi, 0, np.pi]),
+							"resolution": 1.0,
+							"x_label": "Azimuth (rad)",
+							"y_label": "Elevation (rad)",
+						}, dtype=object)
+
+						# Folder name derived from actual T60 / SNR
+						reverb_ms = int(round(T60[i] * 1000))
+						snr_val   = int(round(SNR[j]))
+						folder    = f"Reverb_{reverb_ms}_ms_SNR_{snr_val}_dB"
+						npz_dir   = os.path.join(args.dump_dir, folder)
+						os.makedirs(npz_dir, exist_ok=True)
+						npz_path  = os.path.join(npz_dir, "speakers_2.npz")
+
+						np.savez(
+							npz_path,
+							all_likelihood_maps     = all_likelihood_maps,
+							all_estimated_positions = all_estimated_positions,
+							speaker_pos             = speaker_pos,
+							speaker_metrics         = speaker_metrics,
+							rir_obj                 = rir_obj,
+							seed                    = np.array(args.seed),
+							type_                   = np.array(dataset_mode),
+							distance                = np.array(None),
+							snr                     = np.array(SNR[j]),
+							reverb                  = np.array(T60[i]),
+							speakers                = np.array(K),
+							dumping_factor          = np.array(None),
+							lambda_list             = np.array(None),
+							nele                    = np.array(res_the),
+							nazi                    = np.array(res_phi),
+						)
+						print(f"[NPZ export] Saved → {npz_path}")
+						print(f"  all_likelihood_maps:     {all_likelihood_maps.shape}  float32")
+						print(f"  all_estimated_positions: {all_estimated_positions.shape}  float64")
+						print(f"  speaker_pos:             {speaker_pos.shape}  float32")
+
 					# pred_woDNN, _, = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
 					pred_woDNN, _, _ = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
 
