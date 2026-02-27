@@ -657,7 +657,9 @@ if __name__ == "__main__":
 						print(f"  speaker_pos:             {speaker_pos.shape}  float32")
 
 					# pred_woDNN, _, = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
-					pred_woDNN, _, _ = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
+					skip_woDNN = getattr(args, 'dump_npz', False)
+					if not skip_woDNN:
+						pred_woDNN, _, _ = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
 
 					# Maya fix: 
 					# In simulate mode, learner.predict() returns lists of batches (pred, gt, mic_sig).
@@ -686,7 +688,8 @@ if __name__ == "__main__":
 					pred       = _concat_predgt(pred)
 					gt         = _concat_predgt(gt)
 					mic_sig    = _concat_predgt(mic_sig)
-					pred_woDNN = _concat_predgt(pred_woDNN)
+					if not skip_woDNN:
+						pred_woDNN = _concat_predgt(pred_woDNN)
 
 					# Load CP lambda_hat in getMetric for evaluation-based CP calculation
 					cal_dir = dirs['log'] + '/calibration'
@@ -694,16 +697,18 @@ if __name__ == "__main__":
 
 					# CP regions will now be computed directly during evaluation
 					metrics[:, i, j], metric_keys = learner.evaluate(pred=pred, gt=gt, metric_setting=metric_setting)
-					metrics_woDNN[:, i, j], _ = learner.evaluate(pred=pred_woDNN, gt=gt, metric_setting=metric_setting)
+					if not skip_woDNN:
+						metrics_woDNN[:, i, j], _ = learner.evaluate(pred=pred_woDNN, gt=gt, metric_setting=metric_setting)
 
 					doa_gt = (gt['doa'] * 180 / np.pi).cpu().numpy() 	# (nb, nt, 2, ns)
 					vad_gt = (gt['vad_sources']).cpu().numpy()	# (nb, nt, ns)
 					doa_pred = (pred['doa'] * 180 / np.pi).cpu().numpy()
-					vad_pred = (pred['vad_sources']).cpu().numpy() 
+					vad_pred = (pred['vad_sources']).cpu().numpy()
 					ss_pred = pred['spatial_spectrum'].cpu().numpy()
-					doa_pred_woDNN = (pred_woDNN['doa'] * 180 / np.pi).cpu().numpy()
-					vad_pred_woDNN = (pred_woDNN['vad_sources']).cpu().numpy()
-					ss_pred_woDNN = pred_woDNN['spatial_spectrum'].cpu().numpy()
+					if not skip_woDNN:
+						doa_pred_woDNN = (pred_woDNN['doa'] * 180 / np.pi).cpu().numpy()
+						vad_pred_woDNN = (pred_woDNN['vad_sources']).cpu().numpy()
+						ss_pred_woDNN = pred_woDNN['spatial_spectrum'].cpu().numpy()
 					sensig = mic_sig.cpu().numpy()
 
 					time_stamp = np.arange(seg_len / 2, T * fs - seg_len / 2 + 1, seg_shift)
@@ -719,30 +724,31 @@ if __name__ == "__main__":
 							doa_pred = doa_pred[ins_idx, ...]
 							vad_pred = vad_pred[ins_idx, ...]
 							ss_pred = ss_pred[ins_idx, ...]
-							doa_pred_woDNN = doa_pred_woDNN[ins_idx, ...]
-							vad_pred_woDNN = vad_pred_woDNN[ins_idx, ...]
-							ss_pred_woDNN = ss_pred_woDNN[ins_idx, ...]
+							if not skip_woDNN:
+								doa_pred_woDNN = doa_pred_woDNN[ins_idx, ...]
+								vad_pred_woDNN = vad_pred_woDNN[ins_idx, ...]
+								ss_pred_woDNN = ss_pred_woDNN[ins_idx, ...]
 
 							scipy.io.savemat(result_dir + '/' + method_mode + '_' + source_num_mode + 'DOA_' + 'RT' + str(
 								int(T60[i] * 1000)) + '_SNR' + str(SNR[j]) + '_NS' + str(args.sources[-1]) + '.mat', {
 										'sensig': sensig, 'fs':fs, 'time': time_stamp, 
 										'DOA': doa, 'VAD': vad,  
 										'DOA_pred': doa_pred, 'VAD_pred': vad_pred, 'SS_pred': ss_pred})
-							scipy.io.savemat(result_dir + '/' + method_mode + '_' + source_num_mode + 'DOA_woDNN_' + 'RT' + str(
+							if not skip_woDNN:
+								scipy.io.savemat(result_dir + '/' + method_mode + '_' + source_num_mode + 'DOA_woDNN_' + 'RT' + str(
 								int(T60[i] * 1000)) + '_SNR' + str(SNR[j]) + '_NS' + str(args.sources[-1]) + '.mat', {
-										'sensig':sensig, 'fs':fs, 'time': time_stamp, 
-										'DOA': doa, 'VAD': vad, 
-										'DOA_pred': doa_pred_woDNN, 'VAD_pred': vad_pred_woDNN, 'SS_pred': ss_pred_woDNN})
-    
+								'sensig':sensig, 'fs':fs, 'time': time_stamp, 
+								'DOA': doa, 'VAD': vad, 
+								'DOA_pred': doa_pred_woDNN, 'VAD_pred': vad_pred_woDNN, 'SS_pred': ss_pred_woDNN})
 			if ins_mode == 'all':
 				scipy.io.savemat(result_dir + '/metric_' + source_num_mode + '_NS' + str(args.sources[-1]) + '.mat', 
 					{'metric': metrics, 'SNR': SNR, 'T60': T60, 'metric_key': metric_keys})
-				scipy.io.savemat(result_dir + '/metric_woDNN_' + source_num_mode + '_NS' + str(args.sources[-1]) + '.mat', 
+			if not skip_woDNN:
+				scipy.io.savemat(result_dir + '/metric_woDNN_' + source_num_mode + '_NS' + str(args.sources[-1]) + '.mat',
 					{'metric': metrics_woDNN, 'SNR': SNR, 'T60': T60, 'metric_key': metric_keys})
-
 			print(metric_keys, [round(i, 3) for i in np.mean(np.mean(metrics, axis=2), axis=1)])
-			print('woDNN', metric_keys, ':', [round(i, 3) for i in np.mean(np.mean(metrics_woDNN, axis=2), axis=1)])
-
+			if not skip_woDNN:
+				print('woDNN', metric_keys, ':', [round(i, 3) for i in np.mean(np.mean(metrics_woDNN, axis=2), axis=1)])
 		elif dataset_mode == 'locata':
 			print('- LOCATA Dataset')
 			stage_mode = args.eval_mode[1:] 
