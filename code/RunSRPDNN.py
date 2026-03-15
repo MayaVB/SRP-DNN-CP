@@ -38,7 +38,7 @@ import Dataset as at_dataset
 import LearnerSRPDNN as at_learner
 import ModelSRPDNN as at_model
 import Module as at_module
-from Dataset import Parameter
+from Dataset import Parameter, cart2sph
 from utils import set_seed, set_random_seed, set_learning_rate
 
 if __name__ == "__main__":
@@ -535,7 +535,7 @@ if __name__ == "__main__":
 					dataset_test.SNR = Parameter(SNR[j])
 					set_random_seed(args.seed)
 					if getattr(args, "dump_npz", False) and args.dump_dir:
-						dataset_test.dataset_sz = 500  # NPZ export requires exactly 500 examples
+						dataset_test.dataset_sz = 500  # quick and dirty verify: small dataset
 					dataloader_test = torch.utils.data.DataLoader(dataset=dataset_test, batch_size=args.bs[2], shuffle=False, **kwargs)
 					pred, gt, mic_sig = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=True)
 
@@ -546,10 +546,14 @@ if __name__ == "__main__":
 							f"[NPZ export] Expected K=2 speakers, got K={K}. "
 							f"Use --localize-mode IDL kNum 2 so iter_maps has exactly 2 iterations."
 						)
-						maps_list    = []
-						est_list     = []
-						gt_list      = []
-						metric_lists = {k: [] for k in range(K)}
+						maps_list           = []
+						frames_list         = []
+						est_list            = []
+						gt_list             = []
+						est_frames_list     = []
+						gt_frames_list      = []
+						metric_lists    = {k: [] for k in range(K)}
+						burst_meta_list = []
 
 						for item_idx, (p, g) in enumerate(zip(pred, gt)):
 							# Sanity checks
@@ -588,23 +592,58 @@ if __name__ == "__main__":
 								item_gt[k]   = g["doa"][0, min(t_star, nt_gt - 1), :, k].cpu().numpy()  # clamp for static
 
 							maps_list.append(item_maps)
+							frames_list.append(np.stack([im[k, 0] for k in range(K)], axis=0))  # (K, nt, nele, nazi)
 							est_list.append(item_est)
 							gt_list.append(item_gt)
+							est_frames_list.append(p["doa"][0].cpu().numpy().transpose(2, 0, 1).astype(np.float64))  # (K, nt, 2)
+							gt_frames_list.append(g["doa"][0].cpu().numpy().transpose(2, 0, 1).astype(np.float32))   # (K, nt_gt, 2)
+
+							_burst_active = bool(g.get('burst_active', torch.tensor(0.0)).item() > 0.5)
+							if _burst_active:
+								_bxyz  = g['burst_src_pos'][0].cpu().numpy().astype(np.float32)    # (3,) world
+								_apos  = g['burst_array_pos'][0].cpu().numpy().astype(np.float32)  # (3,) world
+								_brel  = (_bxyz - _apos).astype(np.float32)                         # (3,) array-relative
+								_bang  = cart2sph(_brel.reshape(1, 3))[0, 1:3].astype(np.float32)  # [ele, azi] radians
+								_ele_cand = np.linspace(0,      np.pi, res_the)
+								_azi_cand = np.linspace(-np.pi, np.pi, res_phi)
+								_gidx = np.array([
+									int(np.argmin(np.abs(_ele_cand - _bang[0]))),
+									int(np.argmin(np.abs(_azi_cand - _bang[1]))),
+								], dtype=np.int64)
+							else:
+								_bxyz = _apos = _brel = _bang = _gidx = None
+							_bstart = int(g.get('burst_start_sample',    torch.tensor(0)).item())
+							_blen   = int(g.get('burst_length_samples',  torch.tensor(0)).item())
+							burst_meta_list.append({
+								'burst_active':         _burst_active,
+								'burst_snr_db':         float(g.get('burst_snr_db', torch.tensor(0.0)).item()),
+								'burst_start_sample':   _bstart,
+								'burst_length_samples': _blen,
+								'burst_frame_start':    (_bstart // seg_shift) if _burst_active else None,
+								'burst_frame_end':      ((_bstart + _blen) // seg_shift) if _burst_active else None,
+								'burst_src_pos':        _bxyz,
+								'array_pos':            _apos,
+								'burst_rel_pos_xyz':    _brel,
+								'burst_pos_ang':        _bang,
+								'burst_grid_idx':       _gidx,
+							})
 
 							for k in range(K):
 								metric_lists[k].append(float(np.max(item_maps[k])))
 
 						# Stack into final arrays
-						all_likelihood_maps     = np.stack(maps_list, axis=0).astype(np.float32)  # (N, K, 37, 73)
-						all_estimated_positions = np.stack(est_list,  axis=0).astype(np.float64)  # (N, K, 2)
-						speaker_pos             = np.stack(gt_list,   axis=0).astype(np.float32)  # (N, K, 2)
+						all_likelihood_maps              = np.stack(maps_list,       axis=0).astype(np.float32)   # (N, K, nele, nazi)
+						all_likelihood_maps_frames       = np.stack(frames_list,     axis=0).astype(np.float32)   # (N, K, nt, nele, nazi)
+						all_estimated_positions          = np.stack(est_list,        axis=0).astype(np.float64)   # (N, K, 2)
+						speaker_pos                      = np.stack(gt_list,         axis=0).astype(np.float32)   # (N, K, 2)
+						all_estimated_positions_frames   = np.stack(est_frames_list, axis=0).astype(np.float64)   # (N, K, nt, 2)
+						speaker_pos_frames               = np.stack(gt_frames_list,  axis=0).astype(np.float32)   # (N, K, nt_gt, 2)
 						N = len(maps_list)
 
 						# Shape asserts
-						assert N == 500, f"[NPZ export] Expected 500 items, got {N}"
-						assert all_likelihood_maps.shape     == (500, K, res_the, res_phi)
-						assert all_estimated_positions.shape == (500, K, 2)
-						assert speaker_pos.shape             == (500, K, 2)
+						assert all_likelihood_maps.shape     == (N, K, res_the, res_phi)
+						assert all_estimated_positions.shape == (N, K, 2)
+						assert speaker_pos.shape             == (N, K, 2)
 
 						# speaker_metrics: object dict {k: {"softmax_prob": list[N]}}
 						speaker_metrics = np.array(
@@ -633,6 +672,22 @@ if __name__ == "__main__":
 						os.makedirs(npz_dir, exist_ok=True)
 						npz_path  = os.path.join(npz_dir, "speakers_2.npz")
 
+						burst_metadata = np.empty(N, dtype=object)
+						for _i, _bm in enumerate(burst_meta_list):
+							burst_metadata[_i] = _bm
+						burst_cfg = np.array(
+							{
+								'enabled':        getattr(args, 'enable_dirburst', False),
+								'num_bursts':     getattr(args, 'dirburst_num_bursts', None),
+								'duration_min':   getattr(args, 'dirburst_duration_min', None),
+								'duration_max':   getattr(args, 'dirburst_duration_max', None),
+								'snr_db':         getattr(args, 'dirburst_snr', None),
+								'color':          getattr(args, 'dirburst_color', None),
+								'seed':           getattr(args, 'seed', None),
+								'source_state':   getattr(args, 'source_state', None),
+								'eval_mode':      getattr(args, 'eval_mode', None),
+							}, dtype=object)
+
 						np.savez(
 							npz_path,
 							all_likelihood_maps     = all_likelihood_maps,
@@ -640,6 +695,8 @@ if __name__ == "__main__":
 							speaker_pos             = speaker_pos,
 							speaker_metrics         = speaker_metrics,
 							rir_obj                 = rir_obj,
+							burst_metadata          = burst_metadata,
+							burst_cfg               = burst_cfg,
 							seed                    = np.array(args.seed),
 							type_                   = np.array(dataset_mode),
 							distance                = np.array(None),
@@ -648,13 +705,87 @@ if __name__ == "__main__":
 							speakers                = np.array(K),
 							dumping_factor          = np.array(None),
 							lambda_list             = np.array(None),
-							nele                    = np.array(res_the),
-							nazi                    = np.array(res_phi),
+							nele                       = np.array(res_the),
+							nazi                       = np.array(res_phi),
+							all_likelihood_maps_frames       = all_likelihood_maps_frames,
+							all_estimated_positions_frames   = all_estimated_positions_frames,
+							speaker_pos_frames               = speaker_pos_frames,
+							nt                               = np.array(all_likelihood_maps_frames.shape[2]),
+							hop_samples                = np.array(int(win_len * win_shift_ratio)),
+							win_samples                = np.array(win_len),
+							seg_shift_samples          = np.array(seg_shift),
 						)
 						print(f"[NPZ export] Saved → {npz_path}")
-						print(f"  all_likelihood_maps:     {all_likelihood_maps.shape}  float32")
-						print(f"  all_estimated_positions: {all_estimated_positions.shape}  float64")
-						print(f"  speaker_pos:             {speaker_pos.shape}  float32")
+						print(f"  all_likelihood_maps:        {all_likelihood_maps.shape}  float32")
+						print(f"  all_likelihood_maps_frames: {all_likelihood_maps_frames.shape}  float32")
+						print(f"  speaker_pos_frames:         {speaker_pos_frames.shape}  float32")
+						print(f"  all_estimated_positions:    {all_estimated_positions.shape}  float64")
+						print(f"  speaker_pos:                {speaker_pos.shape}  float32")
+
+						if getattr(args, "dump_npz_flat", False):
+							flat_maps   = []
+							flat_est    = []
+							flat_gt     = []
+							flat_sidx   = []
+							flat_fidx   = []
+							flat_burst_active = []
+							flat_burst_grid   = []
+							flat_gt_valid     = []  # True only for frames where real GT exists (t < nt_gt)
+							for s_idx, (fmaps, fests, fgts, bmeta) in enumerate(
+									zip(frames_list, est_frames_list, gt_frames_list, burst_meta_list)):
+								nt_s    = fmaps.shape[1]   # (K, nt, nele, nazi)
+								nt_gt_s = fgts.shape[1]    # (K, nt_gt, 2)
+								bf_start = bmeta.get("burst_frame_start")
+								bf_end   = bmeta.get("burst_frame_end")
+								b_gidx   = bmeta.get("burst_grid_idx")  # (2,) or None
+								for t in range(nt_s):
+									flat_maps.append(fmaps[:, t, :, :])
+									flat_est.append(fests[:, t, :])
+									# NOTE: if t >= nt_gt_s the GT is clamped to the last real frame.
+									# gt_valid_per_frame marks which frames have genuine GT.
+									flat_gt.append(fgts[:, min(t, nt_gt_s - 1), :])
+									flat_gt_valid.append(t < nt_gt_s)
+									flat_sidx.append(s_idx)
+									flat_fidx.append(t)
+									b_at_t = (bmeta["burst_active"] and
+										          bf_start is not None and bf_end is not None and
+										          bf_start <= t <= bf_end)
+									flat_burst_active.append(b_at_t)
+									flat_burst_grid.append(
+										b_gidx.copy() if b_at_t else np.array([-1, -1], dtype=np.int64))
+							N_flat = len(flat_sidx)
+							all_lm_flat  = np.stack(flat_maps, axis=0).astype(np.float32)   # (N_flat, K, nele, nazi)
+							all_est_flat = np.stack(flat_est,  axis=0).astype(np.float64)   # (N_flat, K, 2)
+							sp_flat      = np.stack(flat_gt,   axis=0).astype(np.float32)   # (N_flat, K, 2)
+							frames_per_sample = np.array([frames_list[s].shape[1] for s in range(N)], dtype=np.int64)  # (N,)
+							flat_path = os.path.join(npz_dir, "speakers_2_flat.npz")
+							np.savez(
+								flat_path,
+								all_likelihood_maps      = all_lm_flat,
+								all_estimated_positions  = all_est_flat,
+								speaker_pos              = sp_flat,
+								sample_idx_per_frame     = np.array(flat_sidx, dtype=np.int64),
+								frame_idx_per_frame      = np.array(flat_fidx, dtype=np.int64),
+								gt_valid_per_frame       = np.array(flat_gt_valid, dtype=bool),
+								frames_per_sample        = frames_per_sample,
+								burst_active_per_frame   = np.array(flat_burst_active, dtype=bool),
+								burst_grid_idx_per_frame = np.stack(flat_burst_grid, axis=0).astype(np.int64),
+								burst_cfg                = burst_cfg,
+								seed                     = np.array(args.seed),
+								type_                    = np.array(dataset_mode),
+								snr                      = np.array(SNR[j]),
+								reverb                   = np.array(T60[i]),
+								speakers                 = np.array(K),
+								nele                     = np.array(res_the),
+								nazi                     = np.array(res_phi),
+								seg_shift_samples        = np.array(seg_shift),
+								hop_samples              = np.array(int(win_len * win_shift_ratio)),
+								win_samples              = np.array(win_len),
+							)
+							print(f"[NPZ flat export] Saved → {flat_path}")
+							print(f"  all_likelihood_maps: {all_lm_flat.shape}  float32  (N_flat={N_flat} = {N} samples × ~{N_flat//N} frames)")
+							print(f"  speaker_pos:         {sp_flat.shape}  float32")
+
 
 					# pred_woDNN, _, = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=False)
 					skip_woDNN = getattr(args, 'dump_npz', False)

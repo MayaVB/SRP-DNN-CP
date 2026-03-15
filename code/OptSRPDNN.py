@@ -48,6 +48,8 @@ class opt():
         # NPZ spectrum dump
         parser.add_argument('--dump-npz', action='store_true', default=False,
                             help='Export per-example SRP spectra and DOA to a single .npz (use with --test)')
+        parser.add_argument('--dump-npz-flat', action='store_true', default=False,
+                            help='Export time-flattened .npz: shape (N_flat, K, nele, nazi) where N_flat = sum of all frames across samples. Saved alongside --dump-npz as speakers_2_flat.npz')
         parser.add_argument('--dump-dir', type=str, default='', metavar='DumpDir',
                             help='Root directory for .npz output. File saved to <dump-dir>/Reverb_<T60ms>_ms_SNR_<SNR>_dB/speakers_2.npz')
 

@@ -406,6 +406,15 @@ class AcousticScene:
 			else:
 				self.burst_positions = []
 
+		# Capture per-sample burst metadata
+		if (hasattr(self, 'noiseDataset') and self.noiseDataset is not None and
+				hasattr(self.noiseDataset, 'dirburst_dataset') and
+				hasattr(self.noiseDataset.dirburst_dataset, 'last_burst_meta')):
+			self.burst_meta = self.noiseDataset.dirburst_dataset.last_burst_meta
+		else:
+			self.burst_meta = {'burst_active': False, 'burst_color': None, 'burst_snr_db': 0.0,
+							   'burst_start_sample': 0, 'burst_length_samples': 0, 'burst_src_pos': None}
+
 		return mic_signals
 	
 	def checkRIR(self, RIRs):
@@ -851,6 +860,8 @@ class DirBurstDataset():
 		Returns:
 			Modified rev_signals with directional noise bursts
 		"""
+		self.last_burst_meta = {'burst_active': False, 'burst_color': None, 'burst_snr_db': 0.0,
+								'burst_start_sample': 0, 'burst_length_samples': 0, 'burst_src_pos': None}
 		if not self.enabled:
 			return rev_signals
 
@@ -890,7 +901,9 @@ class DirBurstDataset():
 				'src_pos': src_pos,
 				'array_pos': array_pos,
 				'start_time': start / fs,
-				'duration': dur
+				'duration': dur,
+				'start_sample': start,
+				'length_samples': L,
 			})
 
 			# Generate simple RIRs for directional burst
@@ -905,6 +918,17 @@ class DirBurstDataset():
 			seg += gain * burst_mics
 			rev_signals[:, start:start+L] = seg
 
+		if self.burst_positions:
+			b0 = self.burst_positions[0]
+			self.last_burst_meta = {
+				'burst_active':         True,
+				'burst_color':          self.color,
+				'burst_snr_db':         float(self.snr_db),
+				'burst_start_sample':   int(b0['start_sample']),
+				'burst_length_samples': int(b0['length_samples']),
+				'burst_src_pos':        b0['src_pos'].astype(np.float32),
+				'array_pos':            b0['array_pos'].astype(np.float32),
+			}
 		return rev_signals
 
 	def _generate_directional_burst(self, src_pos, mic_pos, room_sz, T60, L, fs):
@@ -1082,6 +1106,17 @@ class RandomMicSigDataset(Dataset):
 			gts = {}
 			gts['doa'] = acoustic_scene.DOAw.astype(np.float32)
 			gts['vad_sources'] = acoustic_scene.mic_vad_sources.astype(np.float32)
+			bm = getattr(acoustic_scene, 'burst_meta',
+						 {'burst_active': False, 'burst_snr_db': 0.0,
+						  'burst_start_sample': 0, 'burst_length_samples': 0, 'burst_src_pos': None})
+			gts['burst_active']         = np.array(1.0 if bm['burst_active'] else 0.0, dtype=np.float32)
+			gts['burst_snr_db']         = np.array(bm.get('burst_snr_db') or 0.0, dtype=np.float32)
+			gts['burst_start_sample']   = np.array(bm.get('burst_start_sample') or 0, dtype=np.int64)
+			gts['burst_length_samples'] = np.array(bm.get('burst_length_samples') or 0, dtype=np.int64)
+			_sp = bm.get('burst_src_pos', None)
+			gts['burst_src_pos']        = _sp.astype(np.float32) if _sp is not None else np.zeros(3, dtype=np.float32)
+			_ap = bm.get('array_pos', None)
+			gts['burst_array_pos']      = _ap.astype(np.float32) if _ap is not None else np.zeros(3, dtype=np.float32)
 
 			return mic_signals, gts
 
