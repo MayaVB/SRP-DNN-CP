@@ -1131,6 +1131,11 @@ class RandomMicSigDataset(Dataset):
 									'src_pos':        _sp2,
 									'array_pos':      _ap2 if _ap2 is not None else np.zeros(3, np.float32)}]
 			_NB = 8  # max burst slots for padded arrays
+			if len(_all_bursts) > _NB:
+				import warnings
+				warnings.warn(f"[DirBurst] {len(_all_bursts)} bursts exceed _NB={_NB} padded slots — "
+					f"excess bursts silently dropped. Increase _NB if num_bursts > {_NB}.",
+					RuntimeWarning, stacklevel=2)
 			_b_starts  = np.full(_NB, -1, dtype=np.int64)
 			_b_lengths = np.zeros(_NB, dtype=np.int64)
 			_b_src_pos = np.zeros((_NB, 3), dtype=np.float32)
