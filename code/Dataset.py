@@ -397,7 +397,8 @@ class AcousticScene:
 		# Apply DirBurst if applicable (test time only)
 		if hasattr(self, 'noiseDataset') and self.noiseDataset is not None:
 			mic_signals = self.noiseDataset.apply_dirburst_if_enabled(
-				mic_signals.T, self.room_sz, self.mic_pos, self.T60, sample_id=sample_idx).T
+				mic_signals.T, self.room_sz, self.mic_pos, self.T60,
+				beta=self.beta, array_setup=self.array_setup, sample_id=sample_idx).T
 
 			# Store burst positions in the acoustic scene for plotting
 			if (hasattr(self.noiseDataset, 'dirburst_dataset') and
@@ -664,7 +665,7 @@ class NoiseDataset():
 
 		return noise_signal
 
-	def apply_dirburst_if_enabled(self, mic_signals, room_sz, mic_pos, T60, sample_id=None):
+	def apply_dirburst_if_enabled(self, mic_signals, room_sz, mic_pos, T60, beta=None, array_setup=None, sample_id=None):
 		""" Apply directional noise bursts if enabled and noise_type is 'dirburst'.
 		This should be called during test time after the main simulation.
 		"""
@@ -677,7 +678,8 @@ class NoiseDataset():
 				self.current_sample_id = sample_id
 
 			result = self.dirburst_dataset.inject_directional_noise_bursts(
-				mic_signals, self.fs, room_sz, mic_pos, T60)
+				mic_signals, self.fs, room_sz, mic_pos, T60,
+				beta=beta, array_setup=array_setup)
 
 			# Store burst positions for this sample
 			if hasattr(self.dirburst_dataset, 'burst_positions'):
@@ -847,7 +849,7 @@ class DirBurstDataset():
 		self.enabled = enabled
 		self.burst_positions = []
 
-	def inject_directional_noise_bursts(self, rev_signals, fs, room_sz, mic_pos, T60):
+	def inject_directional_noise_bursts(self, rev_signals, fs, room_sz, mic_pos, T60, beta=None, array_setup=None):
 		""" Add directional noise bursts to existing microphone signals.
 
 		Args:
@@ -908,7 +910,7 @@ class DirBurstDataset():
 
 			# Generate simple RIRs for directional burst
 			burst_mics = self._generate_directional_burst(src_pos, mic_pos, room_sz,
-														  T60, L, fs)
+														  T60, L, fs, beta=beta, array_setup=array_setup)
 
 			# Compute gain for target SNR (use all mics jointly over the window)
 			seg = rev_signals[:, start:start+L]
@@ -932,43 +934,61 @@ class DirBurstDataset():
 			}
 		return rev_signals
 
-	def _generate_directional_burst(self, src_pos, mic_pos, room_sz, T60, L, fs):
-		""" Generate directional noise burst using simplified RIR simulation.
+	def _generate_directional_burst(self, src_pos, mic_pos, room_sz, T60, L, fs,
+									beta=None, array_setup=None):
+		""" Generate directional noise burst using gpuRIR (same as speaker simulation).
+
+		The burst is treated as a stationary point source.  The RIR is computed with
+		the same Sabine-based ISM + diffuse-model parameters used for the speakers, so
+		the burst and speaker signals are acoustically consistent.
+
+		Falls back to free-field delay + exponential-decay approximation only when
+		beta is not available (should not happen in normal use).
 		"""
 		M = mic_pos.shape[0]
-		burst_mics = np.zeros((M, L), dtype=np.float32)
-
-		# Generate burst signal
 		burst_mono = _make_noise_burst(L, fs, color=self.color)
 
-		# Simple distance-based attenuation and delay for each microphone
+		if beta is None:
+			# Should not reach here in normal use; kept as a safety fallback.
+			burst_mics = np.zeros((M, L), dtype=np.float32)
+			for m in range(M):
+				distance = np.linalg.norm(src_pos - mic_pos[m])
+				delay_samples = int(distance / 343.0 * fs)
+				attenuation = 1.0 / max(distance, 0.1)
+				if delay_samples < L:
+					out = np.zeros(L)
+					out[delay_samples:] = burst_mono[:L - delay_samples] * attenuation
+					burst_mics[m] = out
+			return burst_mics
+
+		# ── gpuRIR path (matches speaker simulation exactly) ─────────────────
+		if T60 == 0:
+			Tdiff = 0.1
+			Tmax  = 0.1
+			nb_img = [1, 1, 1]
+		else:
+			Tdiff  = gpuRIR.att2t_SabineEstimator(12, T60)
+			Tmax   = gpuRIR.att2t_SabineEstimator(40, T60)
+			if T60 < 0.15:
+				Tdiff = Tmax
+			nb_img = gpuRIR.t2n(Tdiff, room_sz)
+
+		traj_pts = src_pos.reshape(1, 3)  # stationary source — single trajectory point
+
+		rir_kwargs = {}
+		if array_setup is not None:
+			rir_kwargs['orV_rcv']     = array_setup.mic_orV
+			rir_kwargs['mic_pattern'] = array_setup.mic_pattern
+
+		# RIRs shape: (1, M, rir_len)
+		RIRs = gpuRIR.simulateRIR(room_sz, beta, traj_pts, mic_pos,
+								  nb_img, Tmax, fs, Tdiff=Tdiff, **rir_kwargs)
+
+		burst_mics = np.zeros((M, L), dtype=np.float32)
 		for m in range(M):
-			# Calculate distance and delay
-			distance = np.linalg.norm(src_pos - mic_pos[m])
-			delay_samples = int(distance / 343.0 * fs)  # speed of sound = 343 m/s
-
-			# Apply distance attenuation (1/r law)
-			attenuation = 1.0 / max(distance, 0.1)
-
-			# Apply delay and attenuation
-			if delay_samples < L:
-				delayed_burst = np.zeros(L)
-				delayed_burst[delay_samples:] = burst_mono[:L-delay_samples] * attenuation
-
-				# Simple reverberation tail (exponential decay)
-				if T60 > 0:
-					decay_constant = 3.0 / T60  # -60dB in T60 seconds
-					reverb_tail_length = min(int(T60 * fs), L - delay_samples)
-					if reverb_tail_length > 0:
-						reverb = np.random.randn(reverb_tail_length) * 0.1 * attenuation
-						reverb *= np.exp(-decay_constant * np.arange(reverb_tail_length) / fs)
-						end_idx = min(delay_samples + reverb_tail_length, L)
-						delayed_burst[delay_samples:end_idx] += reverb[:end_idx-delay_samples]
-
-				burst_mics[m] = delayed_burst
-			else:
-				# Source is too far, minimal contribution
-				burst_mics[m] = np.zeros(L) * 0.001 * attenuation
+			rir = RIRs[0, m, :]
+			conv = np.convolve(burst_mono, rir)
+			burst_mics[m] = conv[:L].astype(np.float32)
 
 		return burst_mics
 
