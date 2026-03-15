@@ -535,7 +535,7 @@ if __name__ == "__main__":
 					dataset_test.SNR = Parameter(SNR[j])
 					set_random_seed(args.seed)
 					if getattr(args, "dump_npz", False) and args.dump_dir:
-						dataset_test.dataset_sz = 500  # quick and dirty verify: small dataset
+						dataset_test.dataset_sz = 100  # 100 trajectories × ~104 frames = ~10,400 flat frames
 					dataloader_test = torch.utils.data.DataLoader(dataset=dataset_test, batch_size=args.bs[2], shuffle=False, **kwargs)
 					pred, gt, mic_sig = learner.predict(dataloader_test, return_predgt=True, metric_setting=None, wDNN=True)
 
@@ -599,21 +599,50 @@ if __name__ == "__main__":
 							gt_frames_list.append(g["doa"][0].cpu().numpy().transpose(2, 0, 1).astype(np.float32))   # (K, nt_gt, 2)
 
 							_burst_active = bool(g.get('burst_active', torch.tensor(0.0)).item() > 0.5)
-							if _burst_active:
-								_bxyz  = g['burst_src_pos'][0].cpu().numpy().astype(np.float32)    # (3,) world
-								_apos  = g['burst_array_pos'][0].cpu().numpy().astype(np.float32)  # (3,) world
-								_brel  = (_bxyz - _apos).astype(np.float32)                         # (3,) array-relative
-								_bang  = cart2sph(_brel.reshape(1, 3))[0, 1:3].astype(np.float32)  # [ele, azi] radians
-								_ele_cand = np.linspace(0,      np.pi, res_the)
-								_azi_cand = np.linspace(-np.pi, np.pi, res_phi)
-								_gidx = np.array([
-									int(np.argmin(np.abs(_ele_cand - _bang[0]))),
-									int(np.argmin(np.abs(_azi_cand - _bang[1]))),
-								], dtype=np.int64)
+							_num_active   = int(g.get('burst_num_active', torch.tensor(0)).item()) if _burst_active else 0
+							_starts_all   = g.get('burst_starts_all',    None)   # (batch, _NB)
+							_lengths_all  = g.get('burst_lengths_all',   None)
+							_src_pos_all  = g.get('burst_src_pos_all',   None)   # (batch, _NB, 3)
+							_arr_pos_all  = g.get('burst_array_pos_all', None)
+							_ele_cand = np.linspace(0,      np.pi, res_the)
+							_azi_cand = np.linspace(-np.pi, np.pi, res_phi)
+							_per_burst = []
+							if _burst_active and _num_active > 0 and _starts_all is not None:
+								for _bi in range(_num_active):
+									_bs  = int(_starts_all[0, _bi].item())
+									_bl  = int(_lengths_all[0, _bi].item())
+									_bsp = _src_pos_all[0, _bi].cpu().numpy().astype(np.float32)
+									_bap = _arr_pos_all[0, _bi].cpu().numpy().astype(np.float32)
+									_brel_i = (_bsp - _bap).astype(np.float32)
+									_bang_i = cart2sph(_brel_i.reshape(1, 3))[0, 1:3].astype(np.float32)
+									_gidx_i = np.array([
+										int(np.argmin(np.abs(_ele_cand - _bang_i[0]))),
+										int(np.argmin(np.abs(_azi_cand - _bang_i[1]))),
+									], dtype=np.int64)
+									_per_burst.append({
+										'start_sample':   _bs,
+										'length_samples': _bl,
+										'frame_start':    _bs // seg_shift,
+										'frame_end':      (_bs + _bl - 1) // seg_shift,  # inclusive last frame
+										'src_pos':        _bsp,
+										'array_pos':      _bap,
+										'rel_pos_xyz':    _brel_i,
+										'pos_ang':        _bang_i,
+										'grid_idx':       _gidx_i,
+									})
+							# single-burst backwards-compat fields (first burst)
+							if _per_burst:
+								_b0     = _per_burst[0]
+								_bstart = _b0['start_sample']
+								_blen   = _b0['length_samples']
+								_bxyz   = _b0['src_pos']
+								_apos   = _b0['array_pos']
+								_brel   = _b0['rel_pos_xyz']
+								_bang   = _b0['pos_ang']
+								_gidx   = _b0['grid_idx']
 							else:
+								_bstart = _blen = 0
 								_bxyz = _apos = _brel = _bang = _gidx = None
-							_bstart = int(g.get('burst_start_sample',    torch.tensor(0)).item())
-							_blen   = int(g.get('burst_length_samples',  torch.tensor(0)).item())
 							burst_meta_list.append({
 								'burst_active':         _burst_active,
 								'burst_snr_db':         float(g.get('burst_snr_db', torch.tensor(0.0)).item()),
@@ -626,6 +655,7 @@ if __name__ == "__main__":
 								'burst_rel_pos_xyz':    _brel,
 								'burst_pos_ang':        _bang,
 								'burst_grid_idx':       _gidx,
+								'all_bursts':           _per_burst,  # all injected bursts with frame intervals
 							})
 
 							for k in range(K):
@@ -731,13 +761,12 @@ if __name__ == "__main__":
 							flat_burst_active = []
 							flat_burst_grid   = []
 							flat_gt_valid     = []  # True only for frames where real GT exists (t < nt_gt)
+							_MAX_BURST_SLOTS = 8  # padded burst slots per frame
 							for s_idx, (fmaps, fests, fgts, bmeta) in enumerate(
 									zip(frames_list, est_frames_list, gt_frames_list, burst_meta_list)):
-								nt_s    = fmaps.shape[1]   # (K, nt, nele, nazi)
-								nt_gt_s = fgts.shape[1]    # (K, nt_gt, 2)
-								bf_start = bmeta.get("burst_frame_start")
-								bf_end   = bmeta.get("burst_frame_end")
-								b_gidx   = bmeta.get("burst_grid_idx")  # (2,) or None
+								nt_s      = fmaps.shape[1]   # (K, nt, nele, nazi)
+								nt_gt_s   = fgts.shape[1]    # (K, nt_gt, 2)
+								_all_b    = bmeta.get('all_bursts', [])  # list of per-burst dicts
 								for t in range(nt_s):
 									flat_maps.append(fmaps[:, t, :, :])
 									flat_est.append(fests[:, t, :])
@@ -747,12 +776,17 @@ if __name__ == "__main__":
 									flat_gt_valid.append(t < nt_gt_s)
 									flat_sidx.append(s_idx)
 									flat_fidx.append(t)
-									b_at_t = (bmeta["burst_active"] and
-										          bf_start is not None and bf_end is not None and
-										          bf_start <= t <= bf_end)
-									flat_burst_active.append(b_at_t)
-									flat_burst_grid.append(
-										b_gidx.copy() if b_at_t else np.array([-1, -1], dtype=np.int64))
+									# frame occupies samples [t*seg_shift, t*seg_shift + seg_len)
+									f_samp_start = t * seg_shift
+									f_samp_end   = f_samp_start + seg_len
+									active_gidxs = [_b['grid_idx'] for _b in _all_b
+										if _b['start_sample'] < f_samp_end
+										and _b['start_sample'] + _b['length_samples'] > f_samp_start]
+									flat_burst_active.append(len(active_gidxs) > 0)
+									padded = np.full((_MAX_BURST_SLOTS, 2), -1, dtype=np.int64)
+									for _bi, _gidx in enumerate(active_gidxs[:_MAX_BURST_SLOTS]):
+										padded[_bi] = _gidx
+									flat_burst_grid.append(padded)
 							N_flat = len(flat_sidx)
 							all_lm_flat  = np.stack(flat_maps, axis=0).astype(np.float32)   # (N_flat, K, nele, nazi)
 							all_est_flat = np.stack(flat_est,  axis=0).astype(np.float64)   # (N_flat, K, 2)
@@ -769,8 +803,10 @@ if __name__ == "__main__":
 								gt_valid_per_frame       = np.array(flat_gt_valid, dtype=bool),
 								frames_per_sample        = frames_per_sample,
 								burst_active_per_frame   = np.array(flat_burst_active, dtype=bool),
-								burst_grid_idx_per_frame = np.stack(flat_burst_grid, axis=0).astype(np.int64),
+								burst_count_per_frame    = np.array([int(np.sum(g != -1)) // 2 for g in flat_burst_grid], dtype=np.int64),
+								burst_grid_idx_per_frame = np.stack(flat_burst_grid, axis=0).astype(np.int64),  # (N_flat, MAX_BURST_SLOTS, 2)
 								burst_cfg                = burst_cfg,
+								rir_obj                  = rir_obj,
 								seed                     = np.array(args.seed),
 								type_                    = np.array(dataset_mode),
 								snr                      = np.array(SNR[j]),

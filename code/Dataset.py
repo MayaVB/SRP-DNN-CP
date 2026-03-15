@@ -928,6 +928,7 @@ class DirBurstDataset():
 				'burst_length_samples': int(b0['length_samples']),
 				'burst_src_pos':        b0['src_pos'].astype(np.float32),
 				'array_pos':            b0['array_pos'].astype(np.float32),
+				'all_bursts':           list(self.burst_positions),  # all injected bursts
 			}
 		return rev_signals
 
@@ -1117,6 +1118,33 @@ class RandomMicSigDataset(Dataset):
 			gts['burst_src_pos']        = _sp.astype(np.float32) if _sp is not None else np.zeros(3, dtype=np.float32)
 			_ap = bm.get('array_pos', None)
 			gts['burst_array_pos']      = _ap.astype(np.float32) if _ap is not None else np.zeros(3, dtype=np.float32)
+
+			# Padded all-bursts arrays (fixed width _NB for collation into tensors)
+			_all_bursts = bm.get('all_bursts', [])
+			if not _all_bursts and bm.get('burst_active'):
+				# backwards-compat: wrap single-burst fields into a list
+				_sp2 = bm.get('burst_src_pos', None)
+				_ap2 = bm.get('array_pos', None)
+				if _sp2 is not None:
+					_all_bursts = [{'start_sample':   bm.get('burst_start_sample', 0),
+									'length_samples': bm.get('burst_length_samples', 0),
+									'src_pos':        _sp2,
+									'array_pos':      _ap2 if _ap2 is not None else np.zeros(3, np.float32)}]
+			_NB = 8  # max burst slots for padded arrays
+			_b_starts  = np.full(_NB, -1, dtype=np.int64)
+			_b_lengths = np.zeros(_NB, dtype=np.int64)
+			_b_src_pos = np.zeros((_NB, 3), dtype=np.float32)
+			_b_arr_pos = np.zeros((_NB, 3), dtype=np.float32)
+			for _bi, _b in enumerate(_all_bursts[:_NB]):
+				_b_starts[_bi]  = int(_b['start_sample'])
+				_b_lengths[_bi] = int(_b['length_samples'])
+				_b_src_pos[_bi] = np.asarray(_b['src_pos'],   dtype=np.float32)
+				_b_arr_pos[_bi] = np.asarray(_b['array_pos'], dtype=np.float32)
+			gts['burst_num_active']    = np.array(min(len(_all_bursts), _NB), dtype=np.int64)
+			gts['burst_starts_all']    = _b_starts       # (_NB,)
+			gts['burst_lengths_all']   = _b_lengths      # (_NB,)
+			gts['burst_src_pos_all']   = _b_src_pos      # (_NB, 3)
+			gts['burst_array_pos_all'] = _b_arr_pos      # (_NB, 3)
 
 			return mic_signals, gts
 
