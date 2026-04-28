@@ -1,42 +1,42 @@
-CUDA_VISIBLE_DEVICES=1  python RunSRPDNN.py --train --gen-on-the-fly
-CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --train --gen-on-the-fly --use-amp --gpu-id 1 --source-state static
+# static data generation
+1) go inside container
+2) run these commands below to generate .npz
+3) i need 1 free card in audience to do this
 
-python RunSRPDNN.py --train --gen-on-the-fly --use-amp --gpu-id 0 --source-state static
-
-mirrowing dataset path:
-mkdir -p /home/mayavb/SRP-DNN/data/SrcSig
-ln -s /src/data/SrcSig/LibriSpeech \
-      /home/mayavb/SRP-DNN/data/SrcSig/LibriSpeech
-mkdir -p /home/mayavb/SRP-DNN/data/SrcSig
-
-mirrowing checkpoints path:
-mkdir -p /home/mayavb/SRP-DNN/exp
-ln -s /src/exp/01200846 /home/mayavb/SRP-DNN/exp/01200846
-
-CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --time 01081556 --source-state static --eval-mode simulate all --localize-mode IDL kNum 1 --sources 2 --gen-on-the-fly --use-amp
-CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --time 01081556 --source-state static --eval-mode simulate all --localize-mode IDL kNum 2 --sources 2 --gen-on-the-fly --use-amp
-
-run this:
-CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL unkNum 2 --sources 1 2
-CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
-CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+# ─── TRACKING DATASETS (run inside container) ───────────────────────────────
+# checkpoint 01202049 = DNN trained on mobile data
+# dataset_sz is hardcoded in RunSRPDNN.py line ~538
 
 
-CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py --enable-dirburst --test --gpu-id 0 --use-amp --time 01081556 --source-state static --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
-CUDA_VISIBLE_DEVICES=0 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01081556 --source-state mobile --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+# mobile (no burst) — produces speakers_2.npz + speakers_2_flat.npz
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=1 python RunSRPDNN.py \
+  --test --time 01202049 --eval-mode simulate some \
+  --localize-mode IDL kNum 2 --source-state mobile \
+  --sources 2 2 --gen-on-the-fly --gpu-id 0 \
+  --bs 1 1 1 --seed 2 --dump-npz --dump-npz-flat \
+  --dump-dir ~/PythonProjects/SRP-DNN/npz_output_tracking_no_burst_calib
 
 
+# mobile + burst (2 bursts, pink, SNR=-5 dB, 200-400 ms) — tracking dataset
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 python RunSRPDNN.py \
+  --test --time 01202049 --eval-mode simulate some \
+  --localize-mode IDL kNum 2 --source-state mobile \
+  --sources 2 2 --gen-on-the-fly --gpu-id 0 \
+  --bs 1 1 1 --seed 5 --dump-npz --dump-npz-flat \
+  --enable-dirburst \
+  --dirburst-num-bursts 2 \
+  --dirburst-color pink \
+  --dirburst-snr -5 \
+  --dirburst-duration-min 0.2 \
+  --dirburst-duration-max 0.4 \
+  --dump-dir ~/PythonProjects/SRP-DNN/npz_output_tracking_burst_test
+# verify after run:
+# python verify_burst_export.py ~/PythonProjects/SRP-DNN/npz_output_tracking_burst_test/Reverb_400_ms_SNR_15_dB
 
-dynamic:
-mkdir -p /home/mayavb/SRP-DNN/exp
-ln -s /src/exp/01200846 /home/mayavb/SRP-DNN/exp/01200846
 
-CUDA_VISIBLE_DEVICES=0 python RunSRPDNN.py --test --gpu-id 0 --use-amp --time 01200846 --source-state mobile --gen-on-the-fly --eval-mode simulate all --localize-mode IDL 2 2 --sources 2
+# ─── copy to project folder (run OUTSIDE container) ─────────────────────────
+cp -r /home/mayavb/PythonProjects/SRP-DNN/npz_output_tracking_no_burst_calib/ /src/data/
+cp -r /home/mayavb/PythonProjects/SRP-DNN/npz_output_tracking_burst_test/ /src/data/
+cp -r /home/mayavb/PythonProjects/SRP-DNN/npz_output_tracking_burst_pink/ /src/data/
 
 
-
-SLURM:
-stand at /home/mayavb/PythonProjects/SRP-DNN/code
-sbatch myJob.sh
-dont forget to set the partition in myJob.sh
-dont forget to stand in the code folder when running sbatch
